@@ -87,8 +87,26 @@ def style_dataframe(df, status_cols=None):
     return styled
 
 
+def init_session_state():
+    """初始化session_state，必须在访问任何session_state键之前调用"""
+    defaults = {
+        'env_data': None,
+        'prod_data': None,
+        'env_errors': [],
+        'prod_errors': [],
+        'env_error_rate': 0,
+        'prod_error_rate': 0,
+        'current_page': "📥 数据导入",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
 def main():
     """主应用函数"""
+    
+    init_session_state()
     
     st.sidebar.title("🐔 养殖场环境监测系统")
     
@@ -110,7 +128,7 @@ def main():
     st.sidebar.markdown("---")
     
     has_energy = False
-    if 'env_data' in st.session_state and st.session_state.env_data is not None:
+    if st.session_state.env_data is not None:
         has_energy = has_energy_data(st.session_state.env_data)
     
     pages_list = [
@@ -126,20 +144,17 @@ def main():
     if has_energy:
         pages_list.insert(5, "⚡ 能耗分析")
     
-    page = st.sidebar.radio("功能模块", pages_list)
+    saved_page = st.session_state.current_page
+    default_index = pages_list.index(saved_page) if saved_page in pages_list else 0
     
-    if 'env_data' not in st.session_state:
-        st.session_state.env_data = None
-    if 'prod_data' not in st.session_state:
-        st.session_state.prod_data = None
-    if 'env_errors' not in st.session_state:
-        st.session_state.env_errors = []
-    if 'prod_errors' not in st.session_state:
-        st.session_state.prod_errors = []
-    if 'env_error_rate' not in st.session_state:
-        st.session_state.env_error_rate = 0
-    if 'prod_error_rate' not in st.session_state:
-        st.session_state.prod_error_rate = 0
+    page = st.sidebar.radio(
+        "功能模块",
+        pages_list,
+        index=default_index,
+        key="nav_radio"
+    )
+    
+    st.session_state.current_page = page
     
     if page == "📥 数据导入":
         data_import_page()
