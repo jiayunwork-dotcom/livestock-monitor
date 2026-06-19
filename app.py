@@ -32,6 +32,19 @@ from utils.barn_comparison import (
 )
 from utils.report_generator import generate_daily_report
 
+try:
+    _ver_parts = tuple(int(x) for x in st.__version__.split('.'))
+    ST_VERSION = _ver_parts if len(_ver_parts) >= 2 else (1, 28, 0)
+except Exception:
+    ST_VERSION = (1, 28, 0)
+
+
+def _st_btn_kwargs(full_width=True):
+    """Return button kwargs compatible with current Streamlit version."""
+    if ST_VERSION >= (1, 30, 0) and full_width:
+        return {'use_container_width': True}
+    return {}
+
 
 st.set_page_config(
     page_title="规模化养殖场环境监测与疾病预警系统",
@@ -733,10 +746,10 @@ def disease_warning_page(livestock_type, total_livestock):
                 data=csv_data,
                 file_name=filename,
                 mime="text/csv",
-                use_container_width=True
+                **_st_btn_kwargs()
             )
         else:
-            st.button("📥 导出工单CSV", disabled=True, use_container_width=True)
+            st.button("📥 导出工单CSV", disabled=True, **_st_btn_kwargs())
     
     st.markdown("---")
     st.subheader("📋 预警工单列表")
@@ -1396,7 +1409,7 @@ def batch_management_page():
                     st.write(f"**出栏数量**: {batch['slaughter_count']} 只")
 
             if status == '养殖中':
-                with st.expander("📝 登记出栏", key=f"slaughter_exp_{i}"):
+                with st.expander(f"📝 登记出栏 [{batch['batch_id']}]"):
                     with st.form(f"slaughter_form_{i}"):
                         sc1, sc2 = st.columns(2)
                         with sc1:
