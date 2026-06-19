@@ -109,10 +109,35 @@ def validate_production_data(df):
 
 
 def check_barn_continuity(df, barn_col='栋舍编号'):
-    """检查栋舍编号是否连续"""
+    """
+    检查栋舍编号是否连续
+    返回: (排序列表, 是否连续, 缺失的编号列表)
+    """
+    import re
+    
     barns = df[barn_col].unique()
     barns_sorted = sorted([str(b) for b in barns])
-    return barns_sorted
+    
+    barn_numbers = []
+    for barn in barns_sorted:
+        matches = re.findall(r'\d+', str(barn))
+        if matches:
+            barn_numbers.append(int(matches[-1]))
+    
+    if not barn_numbers:
+        return barns_sorted, True, []
+    
+    barn_numbers_sorted = sorted(barn_numbers)
+    min_num = min(barn_numbers_sorted)
+    max_num = max(barn_numbers_sorted)
+    
+    expected_numbers = set(range(min_num, max_num + 1))
+    actual_numbers = set(barn_numbers_sorted)
+    
+    missing_numbers = sorted(expected_numbers - actual_numbers)
+    is_continuous = len(missing_numbers) == 0
+    
+    return barns_sorted, is_continuous, missing_numbers
 
 
 def check_energy_columns(df):

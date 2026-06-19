@@ -109,35 +109,24 @@ def main():
     
     st.sidebar.markdown("---")
     
-    page = st.sidebar.radio(
-        "功能模块",
-        [
-            "📥 数据导入",
-            "🌡️ 环境舒适度评价",
-            "⚠️ 异常检测",
-            "🏥 疾病预警",
-            "💀 死亡率分析",
-            "📊 多栋舍对比",
-            "📄 报告导出"
-        ]
-    )
-    
     has_energy = False
     if 'env_data' in st.session_state and st.session_state.env_data is not None:
         has_energy = has_energy_data(st.session_state.env_data)
     
+    pages_list = [
+        "📥 数据导入",
+        "🌡️ 环境舒适度评价",
+        "⚠️ 异常检测",
+        "🏥 疾病预警",
+        "💀 死亡率分析",
+        "📊 多栋舍对比",
+        "📄 报告导出"
+    ]
+    
     if has_energy:
-        pages_list = [
-            "📥 数据导入",
-            "🌡️ 环境舒适度评价",
-            "⚠️ 异常检测",
-            "🏥 疾病预警",
-            "💀 死亡率分析",
-            "⚡ 能耗分析",
-            "📊 多栋舍对比",
-            "📄 报告导出"
-        ]
-        page = st.sidebar.radio("功能模块", pages_list, index=pages_list.index(page) if page in pages_list else 0)
+        pages_list.insert(5, "⚡ 能耗分析")
+    
+    page = st.sidebar.radio("功能模块", pages_list)
     
     if 'env_data' not in st.session_state:
         st.session_state.env_data = None
@@ -208,8 +197,11 @@ def data_import_page():
                 st.dataframe(validated_df.head(10), use_container_width=True)
                 st.caption(f"共 {len(validated_df)} 条记录")
                 
-                barns = check_barn_continuity(validated_df)
-                st.write(f"栋舍列表: {', '.join(map(str, barns))}")
+                barns_sorted, is_continuous, missing = check_barn_continuity(validated_df)
+                st.write(f"栋舍列表: {', '.join(map(str, barns_sorted))}")
+                
+                if not is_continuous:
+                    st.warning(f"⚠️ 栋舍编号不连续, 缺失编号: {', '.join(map(str, missing))}")
                 
                 energy_cols = check_energy_columns(validated_df)
                 if energy_cols:
@@ -249,8 +241,11 @@ def data_import_page():
                 st.dataframe(validated_df.head(10), use_container_width=True)
                 st.caption(f"共 {len(validated_df)} 条记录")
                 
-                barns = check_barn_continuity(validated_df)
-                st.write(f"栋舍列表: {', '.join(map(str, barns))}")
+                barns_sorted, is_continuous, missing = check_barn_continuity(validated_df)
+                st.write(f"栋舍列表: {', '.join(map(str, barns_sorted))}")
+                
+                if not is_continuous:
+                    st.warning(f"⚠️ 栋舍编号不连续, 缺失编号: {', '.join(map(str, missing))}")
                 
             except Exception as e:
                 st.error(f"文件解析失败: {str(e)}")
@@ -341,7 +336,7 @@ def comfort_page(livestock_type):
                       annotation_text="中度应激", annotation_position="right")
         
         fig.update_layout(
-            title=f'{selected_barn}栋 THI趋势图',
+            title=f'{selected_barn} THI趋势图',
             xaxis_title='时间',
             yaxis_title='THI指数',
             height=400,
@@ -451,7 +446,7 @@ def anomaly_page():
         ))
     
     fig.update_layout(
-        title=f'{selected_barn}栋 {selected_param} 异常检测',
+        title=f'{selected_barn} {selected_param} 异常检测',
         xaxis_title='时间',
         yaxis_title=selected_param,
         height=450,
@@ -537,7 +532,7 @@ def disease_warning_page(livestock_type, total_livestock):
                           annotation_text="高风险阈值(0.8)", annotation_position="right")
             
             fig.update_layout(
-                title=f'{selected_barn}栋 疾病风险评分时间线',
+                title=f'{selected_barn} 疾病风险评分时间线',
                 xaxis_title='日期',
                 yaxis_title='风险评分',
                 yaxis_range=[0, 1],
@@ -599,7 +594,7 @@ def mortality_page(total_livestock):
                     x=barn_data['日龄'],
                     y=barn_data['累计死淘率(%)'],
                     mode='lines',
-                    name=f'{barn_id}栋 累计',
+                    name=f'{barn_id} 累计',
                     line=dict(color=color, width=2),
                     yaxis='y'
                 ))
@@ -607,7 +602,7 @@ def mortality_page(total_livestock):
                 fig.add_trace(go.Bar(
                     x=barn_data['日龄'],
                     y=barn_data['日死淘率(%)'],
-                    name=f'{barn_id}栋 日死淘',
+                    name=f'{barn_id} 日死淘',
                     opacity=0.5,
                     marker_color=color,
                     yaxis='y2',
@@ -659,7 +654,7 @@ def mortality_page(total_livestock):
             _, inflection_points = detect_mortality_inflection_points(prod_df, barn_id, total_livestock)
             
             if inflection_points:
-                st.markdown(f"**{barn_id}栋 拐点分析**")
+                st.markdown(f"**{barn_id} 拐点分析**")
                 
                 for point in inflection_points[:3]:
                     with st.expander(f"日龄 {point['日龄']} - 环比增长 {point['环比增长(%)']}%"):
@@ -679,7 +674,7 @@ def mortality_page(total_livestock):
                             else:
                                 st.write("无同期环境数据")
             else:
-                st.info(f"{barn_id}栋 未检测到明显拐点")
+                st.info(f"{barn_id} 未检测到明显拐点")
 
 
 def energy_page():
@@ -716,7 +711,7 @@ def energy_page():
             y='CO2浓度(ppm)',
             size='温度' if '温度' in energy_co2_df.columns else None,
             color='湿度' if '湿度' in energy_co2_df.columns else None,
-            title=f'{selected_barn}栋 通风能耗 vs CO2浓度',
+            title=f'{selected_barn} 通风能耗 vs CO2浓度',
             labels={'通风能耗kWh': '通风能耗 (kWh)', 'CO2浓度(ppm)': 'CO2浓度 (ppm)'}
         )
         
@@ -762,7 +757,7 @@ def energy_page():
             ))
         
         fig.update_layout(
-            title=f'{selected_barn}栋 月度能耗趋势',
+            title=f'{selected_barn} 月度能耗趋势',
             xaxis_title='月份',
             yaxis_title='能耗 (kWh)',
             barmode='stack',
@@ -866,7 +861,7 @@ def comparison_page(livestock_type, total_livestock):
                     x=timeline_df['日期'],
                     y=timeline_df['风险评分'],
                     mode='lines+markers',
-                    name=f'{barn_id}栋',
+                    name=f'{barn_id}',
                     line=dict(width=2),
                     marker=dict(size=6)
                 ))

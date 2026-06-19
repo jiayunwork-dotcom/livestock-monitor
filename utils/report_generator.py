@@ -240,7 +240,7 @@ def create_thi_chart(env_df, barn_id, figsize=(6, 3), dpi=100):
     ax.axhline(y=thresholds['轻度热应激'], color='orange', linestyle='--', alpha=0.7, label='轻度应激')
     ax.axhline(y=thresholds['中度热应激'], color='red', linestyle='--', alpha=0.7, label='中度应激')
     
-    ax.set_title(f'{barn_id}栋 THI趋势图', fontsize=12)
+    ax.set_title(f'{barn_id} THI趋势图', fontsize=12)
     ax.set_xlabel('时间', fontsize=10)
     ax.set_ylabel('THI指数', fontsize=10)
     ax.legend(loc='best', fontsize=8)
@@ -277,7 +277,7 @@ def create_mortality_chart(prod_df, barn_id, total_livestock=10000, figsize=(6, 
     ax2.set_ylabel('累计死淘率(%)', color='#4472C4', fontsize=10)
     ax2.tick_params(axis='y', labelcolor='#4472C4')
     
-    ax1.set_title(f'{barn_id}栋 死淘率曲线', fontsize=12)
+    ax1.set_title(f'{barn_id} 死淘率曲线', fontsize=12)
     ax1.grid(True, alpha=0.3)
     
     lines1, labels1 = ax1.get_legend_handles_labels()
@@ -359,7 +359,7 @@ def generate_daily_report(env_df, prod_df, status_df, anomaly_summary, risk_df,
         barn_ids = status_df['栋舍编号'].unique().tolist() if not status_df.empty else []
     
     for i, barn_id in enumerate(barn_ids[:3]):
-        story.append(Paragraph(f'{barn_id}栋 THI趋势图', ParagraphStyle(
+        story.append(Paragraph(f'{barn_id} THI趋势图', ParagraphStyle(
             'ChartTitle', parent=styles['Heading3'], fontName=font_name, fontSize=12, spaceBefore=10
         )))
         
@@ -367,7 +367,7 @@ def generate_daily_report(env_df, prod_df, status_df, anomaly_summary, risk_df,
         if thi_img:
             story.append(Image(thi_img, width=15*cm, height=7*cm))
         
-        story.append(Paragraph(f'{barn_id}栋 死淘率曲线', ParagraphStyle(
+        story.append(Paragraph(f'{barn_id} 死淘率曲线', ParagraphStyle(
             'ChartTitle', parent=styles['Heading3'], fontName=font_name, fontSize=12, spaceBefore=10
         )))
         

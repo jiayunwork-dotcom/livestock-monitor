@@ -109,23 +109,23 @@ def find_largest_difference(env_means_df, prod_df, barn_ids):
             
             if '氨气' in param:
                 suggestions.append(
-                    f"{high_barn}栋{param}显著高于其他栋舍(较{low_barn}高{round(diff_ratio*100, 1)}%), 建议检查通风系统"
+                    f"{high_barn}的{param}显著高于其他栋舍(较{low_barn}高{round(diff_ratio*100, 1)}%), 建议检查通风系统"
                 )
             elif '温度' in param or 'THI' in param:
                 suggestions.append(
-                    f"{high_barn}栋{param}显著高于其他栋舍(较{low_barn}高{round(diff_ratio*100, 1)}%), 建议检查降温设备"
+                    f"{high_barn}的{param}显著高于其他栋舍(较{low_barn}高{round(diff_ratio*100, 1)}%), 建议检查降温设备"
                 )
             elif 'CO2' in param:
                 suggestions.append(
-                    f"{high_barn}栋{param}显著高于其他栋舍(较{low_barn}高{round(diff_ratio*100, 1)}%), 建议加强通风"
+                    f"{high_barn}的{param}显著高于其他栋舍(较{low_barn}高{round(diff_ratio*100, 1)}%), 建议加强通风"
                 )
             elif '湿度' in param:
                 suggestions.append(
-                    f"{high_barn}栋{param}显著高于其他栋舍(较{low_barn}高{round(diff_ratio*100, 1)}%), 建议检查通风和湿度控制"
+                    f"{high_barn}的{param}显著高于其他栋舍(较{low_barn}高{round(diff_ratio*100, 1)}%), 建议检查通风和湿度控制"
                 )
             else:
                 suggestions.append(
-                    f"{high_barn}栋{param}与{low_barn}栋差异较大(差值{round(diff_ratio*100, 1)}%), 建议排查原因"
+                    f"{high_barn}与{low_barn}的{param}差异较大(差值{round(diff_ratio*100, 1)}%), 建议排查原因"
                 )
     
     return suggestions
