@@ -97,6 +97,7 @@ def init_session_state():
         'env_error_rate': 0,
         'prod_error_rate': 0,
         'current_page': "📥 数据导入",
+        'warning_tickets': [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -490,6 +491,135 @@ def anomaly_page():
         st.success("✅ 所有传感器运行正常，未检测到漂移")
 
 
+def generate_suggestions(risk_level, triggered_signals):
+    """根据风险等级和触发信号生成建议措施"""
+    suggestions = []
+    if risk_level in ['低风险', '中风险', '高风险']:
+        suggestions.append('加强栋舍巡查频率，密切观察动物状态')
+    if '采食量异常' in triggered_signals:
+        suggestions.append('检查饲料质量和投喂系统，排查疾病诱因')
+    if '饮水量异常' in triggered_signals:
+        suggestions.append('检查供水系统，确保饮水清洁充足')
+    if '死淘异常' in triggered_signals:
+        suggestions.append('对死淘动物进行剖检，排查传染病风险')
+    if '环境恶化' in triggered_signals:
+        suggestions.append('立即改善通风降温措施，降低热应激')
+    if '空气质量异常' in triggered_signals:
+        suggestions.append('加强通风换气，清理粪便，降低氨气浓度')
+    if risk_level == '中风险':
+        suggestions.append('咨询兽医，考虑预防性投药')
+    if risk_level == '高风险':
+        suggestions.append('隔离观察疑似患病动物，启动应急预案')
+        suggestions.append('对栋舍进行全面消毒')
+    return '；'.join(suggestions) if suggestions else '正常巡查'
+
+
+def auto_generate_warning_tickets(risk_df):
+    """根据风险评估结果自动生成预警工单（含去重）"""
+    tickets = st.session_state.warning_tickets
+    today = datetime.now().date()
+    
+    existing_keys = set()
+    for t in tickets:
+        existing_keys.add((t['栋舍编号'], pd.Timestamp(t['生成时间']).date()))
+    
+    for _, row in risk_df.iterrows():
+        barn_id = row['栋舍编号']
+        risk_level = row['风险等级']
+        risk_score = row['风险评分']
+        triggered_signals = row['触发信号']
+        
+        if risk_level in ['低风险', '中风险', '高风险']:
+            key = (barn_id, today)
+            if key not in existing_keys:
+                new_ticket = {
+                    '工单ID': f"WARN{int(datetime.now().timestamp() * 1000)}",
+                    '生成时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    '栋舍编号': barn_id,
+                    '风险等级': risk_level,
+                    '风险评分': risk_score,
+                    '触发信号': ', '.join(triggered_signals) if triggered_signals else '无',
+                    '建议措施': generate_suggestions(risk_level, triggered_signals),
+                    '处置状态': '待处理',
+                    '处置备注': '',
+                    '关闭时间': None,
+                }
+                tickets.append(new_ticket)
+    
+    st.session_state.warning_tickets = tickets
+
+
+def calculate_warning_statistics():
+    """计算预警统计指标"""
+    tickets = st.session_state.warning_tickets
+    now = datetime.now()
+    week_start = now - timedelta(days=now.weekday())
+    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    
+    week_new = 0
+    pending_count = 0
+    total_closed_hours = 0
+    closed_count = 0
+    week_total = 0
+    week_closed = 0
+    
+    for t in tickets:
+        create_time = pd.Timestamp(t['生成时间'])
+        if create_time >= week_start:
+            week_total += 1
+            week_new += 1
+        
+        if t['处置状态'] == '待处理':
+            pending_count += 1
+        
+        if t['处置状态'] == '已关闭' and t['关闭时间']:
+            close_time = pd.Timestamp(t['关闭时间'])
+            duration = (close_time - create_time).total_seconds() / 3600
+            total_closed_hours += duration
+            closed_count += 1
+            if create_time >= week_start:
+                week_closed += 1
+    
+    avg_duration = round(total_closed_hours / closed_count, 1) if closed_count > 0 else 0
+    week_close_rate = round((week_closed / week_total) * 100, 1) if week_total > 0 else 0
+    
+    return {
+        'week_new': week_new,
+        'pending_count': pending_count,
+        'avg_duration': avg_duration,
+        'week_close_rate': week_close_rate,
+    }
+
+
+def style_ticket_row(row):
+    """根据工单状态设置行底色"""
+    status = row['处置状态']
+    if status == '待处理':
+        return ['background-color: #FFC7CE'] * len(row)
+    elif status == '处理中':
+        return ['background-color: #FFEB9C'] * len(row)
+    elif status == '已关闭':
+        return ['background-color: #C6EFCE'] * len(row)
+    else:
+        return [''] * len(row)
+
+
+def export_tickets_csv():
+    """导出工单数据为CSV"""
+    tickets = st.session_state.warning_tickets
+    if not tickets:
+        return None
+    
+    df = pd.DataFrame(tickets)
+    display_cols = ['工单ID', '生成时间', '栋舍编号', '风险等级', '风险评分', 
+                    '触发信号', '建议措施', '处置状态', '处置备注', '关闭时间']
+    df = df[display_cols]
+    
+    output = io.BytesIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig')
+    return output.getvalue()
+
+
 def disease_warning_page(livestock_type, total_livestock):
     """疾病预警页面"""
     st.header("🏥 疾病预警模型")
@@ -516,6 +646,8 @@ def disease_warning_page(livestock_type, total_livestock):
         use_container_width=True,
         hide_index=True
     )
+    
+    auto_generate_warning_tickets(risk_df)
     
     st.markdown("---")
     st.subheader("📈 风险评分时间线")
@@ -573,6 +705,116 @@ def disease_warning_page(livestock_type, total_livestock):
     ])
     
     st.table(weight_df)
+    
+    st.markdown("---")
+    st.header("🚨 预警处置")
+    
+    stats = calculate_warning_statistics()
+    
+    stat_col1, stat_col2, stat_col3, stat_col4, stat_col5 = st.columns([1, 1, 1, 1, 1])
+    with stat_col1:
+        st.metric("本周新增预警数", stats['week_new'])
+    with stat_col2:
+        st.metric("待处理工单数", stats['pending_count'])
+    with stat_col3:
+        st.metric("平均处置时长(小时)", stats['avg_duration'])
+    with stat_col4:
+        st.metric("本周关闭率(%)", stats['week_close_rate'])
+    with stat_col5:
+        csv_data = export_tickets_csv()
+        if csv_data:
+            filename = f"预警工单_{datetime.now().strftime('%Y%m%d')}.csv"
+            st.download_button(
+                label="📥 导出工单CSV",
+                data=csv_data,
+                file_name=filename,
+                mime="text/csv",
+                use_container_width=True
+            )
+        else:
+            st.button("📥 导出工单CSV", disabled=True, use_container_width=True)
+    
+    st.markdown("---")
+    st.subheader("📋 预警工单列表")
+    
+    tickets = st.session_state.warning_tickets
+    if not tickets:
+        st.info("暂无预警工单")
+        return
+    
+    sorted_tickets = sorted(tickets, key=lambda x: x['生成时间'], reverse=True)
+    
+    display_cols = ['工单ID', '生成时间', '栋舍编号', '风险等级', '风险评分', 
+                    '触发信号', '建议措施', '处置状态', '处置备注', '关闭时间']
+    
+    for idx, ticket in enumerate(sorted_tickets):
+        with st.container():
+            status = ticket['处置状态']
+            if status == '待处理':
+                bg_color = '#FFC7CE'
+            elif status == '处理中':
+                bg_color = '#FFEB9C'
+            elif status == '已关闭':
+                bg_color = '#C6EFCE'
+            else:
+                bg_color = '#FFFFFF'
+            
+            st.markdown(
+                f"""
+                <div style="padding: 10px; border-radius: 5px; margin-bottom: 10px; background-color: {bg_color};">
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            
+            col_id, col_time, col_barn, col_level, col_score, col_signals = st.columns([2, 2, 1, 1, 1, 3])
+            with col_id:
+                st.markdown(f"**工单ID**: {ticket['工单ID']}")
+            with col_time:
+                st.markdown(f"**生成时间**: {ticket['生成时间']}")
+            with col_barn:
+                st.markdown(f"**栋舍**: {ticket['栋舍编号']}")
+            with col_level:
+                st.markdown(f"**等级**: {ticket['风险等级']}")
+            with col_score:
+                st.markdown(f"**评分**: {ticket['风险评分']}")
+            with col_signals:
+                st.markdown(f"**触发信号**: {ticket['触发信号']}")
+            
+            st.markdown(f"**建议措施**: {ticket['建议措施']}")
+            
+            edit_col1, edit_col2, edit_col3, edit_col4 = st.columns([1, 3, 1, 1])
+            with edit_col1:
+                new_status = st.selectbox(
+                    "处置状态",
+                    ["待处理", "处理中", "已关闭"],
+                    index=["待处理", "处理中", "已关闭"].index(ticket['处置状态']),
+                    key=f"status_{ticket['工单ID']}"
+                )
+            with edit_col2:
+                new_remark = st.text_input(
+                    "处置备注",
+                    value=ticket['处置备注'],
+                    placeholder="请记录实际采取的措施...",
+                    key=f"remark_{ticket['工单ID']}"
+                )
+            with edit_col3:
+                if ticket['关闭时间']:
+                    st.markdown(f"**关闭时间**: {ticket['关闭时间']}")
+                else:
+                    st.markdown("**关闭时间**: 未关闭")
+            with edit_col4:
+                if st.button("更新状态", key=f"update_{ticket['工单ID']}", type="primary"):
+                    for t in st.session_state.warning_tickets:
+                        if t['工单ID'] == ticket['工单ID']:
+                            t['处置状态'] = new_status
+                            t['处置备注'] = new_remark
+                            if new_status == '已关闭' and not t['关闭时间']:
+                                t['关闭时间'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            elif new_status != '已关闭':
+                                t['关闭时间'] = None
+                            break
+                    st.rerun()
 
 
 def mortality_page(total_livestock):
