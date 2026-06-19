@@ -147,11 +147,13 @@ def main():
     saved_page = st.session_state.current_page
     default_index = pages_list.index(saved_page) if saved_page in pages_list else 0
     
+    nav_key = f"nav_radio_energy_{has_energy}"
+    
     page = st.sidebar.radio(
         "功能模块",
         pages_list,
         index=default_index,
-        key="nav_radio"
+        key=nav_key
     )
     
     st.session_state.current_page = page
