@@ -119,6 +119,10 @@ def init_session_state():
         'feed_formula_result': None,
         'saved_formulas': [],
         'sensitivity_result': None,
+        'ingredient_price_history': {},
+        'predicted_prices': {},
+        'predicted_feed_formula_result': None,
+        'global_feed_unit_price_predicted': None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1246,10 +1250,10 @@ def _next_batch_id():
     return f"B{max_num + 1:03d}"
 
 
-def _calculate_feed_cost(barn_id, start_date, end_date):
+def _calculate_feed_cost(barn_id, start_date, end_date, use_predicted=False):
     prod_df = st.session_state.prod_data
     if prod_df is None:
-        return None, 0.0, True
+        return None, 0.0, True, None
 
     prod_df_copy = prod_df.copy()
     prod_df_copy['时间戳'] = pd.to_datetime(prod_df_copy['时间戳'])
@@ -1264,18 +1268,25 @@ def _calculate_feed_cost(barn_id, start_date, end_date):
     ]
 
     if barn_data.empty:
-        return None, 0.0, True
+        return None, 0.0, True, None
 
     total_feed = barn_data['日采食量(kg)'].sum()
     feed_unit_price = _get_feed_unit_price()
     feed_cost = total_feed * feed_unit_price
+
+    predicted_feed_cost = None
+    predicted_unit_price = st.session_state.get('global_feed_unit_price_predicted', None)
+    if use_predicted and predicted_unit_price is not None:
+        predicted_feed_cost = total_feed * predicted_unit_price
+    elif predicted_unit_price is not None:
+        predicted_feed_cost = total_feed * predicted_unit_price
 
     total_days = (end_ts - start_ts).days + 1
     covered_days = barn_data['时间戳'].dt.date.nunique()
     coverage = covered_days / total_days if total_days > 0 else 0
     data_incomplete = coverage < 0.8
 
-    return total_feed, feed_cost, data_incomplete
+    return total_feed, feed_cost, data_incomplete, predicted_feed_cost
 
 
 def _calculate_batch_health_score(batch, livestock_type='肉鸡', total_livestock=10000):
@@ -1347,7 +1358,7 @@ def _calculate_economic_indicators(batch):
     start_date = batch['start_date']
     end_date = batch['slaughter_date']
 
-    total_feed, feed_cost, data_incomplete = _calculate_feed_cost(barn_id, start_date, end_date)
+    total_feed, feed_cost, data_incomplete, predicted_feed_cost = _calculate_feed_cost(barn_id, start_date, end_date)
 
     chick_cost = chick_count * chick_price
     other_cost = chick_count * OTHER_COST_PER_BIRD
@@ -1363,16 +1374,33 @@ def _calculate_economic_indicators(batch):
     survival_rate = (slaughter_count / chick_count) * 100 if chick_count > 0 else 0
     profit_per_bird = profit / slaughter_count if slaughter_count > 0 else 0
 
+    profit_margin_pct = (profit / total_revenue * 100) if total_revenue > 0 else 0
+    predicted_profit_margin_pct = None
+    predicted_profit = None
+    profit_margin_change_pct = None
+
+    if predicted_feed_cost is not None:
+        predicted_total_cost = chick_cost + predicted_feed_cost + other_cost
+        predicted_profit = total_revenue - predicted_total_cost
+        predicted_profit_margin_pct = (predicted_profit / total_revenue * 100) if total_revenue > 0 else 0
+        profit_margin_change_pct = predicted_profit_margin_pct - profit_margin_pct
+
     return {
         'chick_cost': chick_cost,
         'feed_cost': feed_cost,
+        'predicted_feed_cost': predicted_feed_cost,
         'other_cost': other_cost,
         'total_cost': total_cost,
         'total_revenue': total_revenue,
         'profit': profit,
+        'predicted_profit': predicted_profit,
+        'profit_margin_pct': profit_margin_pct,
+        'predicted_profit_margin_pct': predicted_profit_margin_pct,
+        'profit_margin_change_pct': profit_margin_change_pct,
         'fcr': fcr,
         'survival_rate': survival_rate,
         'profit_per_bird': profit_per_bird,
+        'predicted_profit_per_bird': (predicted_profit / slaughter_count) if (predicted_profit is not None and slaughter_count > 0) else None,
         'total_feed': total_feed,
         'data_incomplete': data_incomplete,
     }
@@ -1439,10 +1467,17 @@ def batch_management_page():
     st.markdown("---")
 
     current_feed_price = _get_feed_unit_price()
+    predicted_feed_price = st.session_state.get('global_feed_unit_price_predicted', None)
     if current_feed_price != DEFAULT_FEED_UNIT_PRICE:
-        st.info(f"💡 当前饲料单价: **{current_feed_price:.2f} 元/kg** (由「饲料配方模拟与成本优化」模块提供)")
+        info_text = f"💡 当前饲料单价: **{current_feed_price:.2f} 元/kg** (由「饲料配方模拟与成本优化」模块提供)"
+        if predicted_feed_price is not None:
+            info_text += f"\n\n🔮 预测下月饲料单价: **{predicted_feed_price:.2f} 元/kg**"
+        st.info(info_text)
     else:
-        st.info(f"💡 当前饲料单价: **{current_feed_price:.2f} 元/kg** (默认值，可在「饲料配方模拟与成本优化」模块中调整)")
+        info_text = f"💡 当前饲料单价: **{current_feed_price:.2f} 元/kg** (默认值，可在「饲料配方模拟与成本优化」模块中调整)"
+        if predicted_feed_price is not None:
+            info_text += f"\n\n🔮 预测下月饲料单价: **{predicted_feed_price:.2f} 元/kg**"
+        st.info(info_text)
     
     st.markdown("---")
 
@@ -1649,6 +1684,12 @@ def batch_management_page():
                         st.metric("总收入", f"{indicators['total_revenue']:.2f} 元")
                         st.markdown(f"**苗鸡成本**: {chick_cost:.2f} 元, 占比{chick_pct:.1f}%")
                         st.markdown(f"**饲料成本**{incomplete_suffix}: {feed_cost:.2f} 元, 占比{feed_pct:.1f}%")
+                        if indicators['predicted_feed_cost'] is not None:
+                            pred_feed = indicators['predicted_feed_cost']
+                            pred_pct = (pred_feed / (chick_cost + pred_feed + other_cost) * 100) if (chick_cost + pred_feed + other_cost) > 0 else 0
+                            feed_diff_pct = ((pred_feed - feed_cost) / feed_cost * 100) if feed_cost > 0 else 0
+                            arrow = "⬆️" if feed_diff_pct > 0 else "⬇️"
+                            st.markdown(f"**预测饲料成本**{incomplete_suffix}: {pred_feed:.2f} 元 {arrow}{abs(feed_diff_pct):.1f}%, 占比{pred_pct:.1f}%")
                         st.markdown(f"**其他成本**: {other_cost:.2f} 元, 占比{other_pct:.1f}%")
                     with ic2:
                         total_cost_label = f"**总投入**{incomplete_suffix}"
@@ -1656,6 +1697,11 @@ def batch_management_page():
                         profit_val = indicators['profit']
                         profit_label = f"**利润**{incomplete_suffix}"
                         st.markdown(f"{profit_label}: {profit_val:.2f} 元 ({'盈利' if profit_val >= 0 else '亏损'})")
+                        if indicators['predicted_profit'] is not None:
+                            pred_profit = indicators['predicted_profit']
+                            profit_diff = pred_profit - profit_val
+                            arrow = "⬆️" if profit_diff >= 0 else "⬇️"
+                            st.markdown(f"**预测利润**{incomplete_suffix}: {pred_profit:.2f} 元 {arrow}{abs(profit_diff):.2f}元")
                         if indicators['fcr'] is not None:
                             fcr_label = f"**料肉比**{incomplete_suffix}"
                             st.markdown(f"{fcr_label}: {indicators['fcr']:.3f}")
@@ -1665,6 +1711,17 @@ def batch_management_page():
                         st.markdown(f"**成活率**: {indicators['survival_rate']:.1f}%")
                         ppb_label = f"**每只利润**{incomplete_suffix}"
                         st.markdown(f"{ppb_label}: {indicators['profit_per_bird']:.2f} 元")
+                        if indicators['predicted_profit_per_bird'] is not None:
+                            pred_ppb = indicators['predicted_profit_per_bird']
+                            ppb_diff = pred_ppb - indicators['profit_per_bird']
+                            arrow = "⬆️" if ppb_diff >= 0 else "⬇️"
+                            st.markdown(f"**预测每只利润**{incomplete_suffix}: {pred_ppb:.2f} 元 {arrow}{abs(ppb_diff):.2f}元")
+
+                        if indicators['profit_margin_change_pct'] is not None:
+                            margin_change = indicators['profit_margin_change_pct']
+                            arrow = "⬆️" if margin_change >= 0 else "⬇️"
+                            margin_color = "#006100" if margin_change >= 0 else "#9C0006"
+                            st.markdown(f"**利润率影响**: <span style='color:{margin_color}; font-weight:bold;'>{arrow}{abs(margin_change):.2f}个百分点</span> (当前{indicators['profit_margin_pct']:.1f}% → 预测{indicators['predicted_profit_margin_pct']:.1f}%)", unsafe_allow_html=True)
 
                         health_score = _calculate_batch_health_score(batch)
                         if health_score:
@@ -1713,7 +1770,7 @@ def batch_management_page():
                 feed_pct = (feed_cost / total_cost * 100) if total_cost > 0 else 0
                 other_pct = (other_cost / total_cost * 100) if total_cost > 0 else 0
 
-                details.append({
+                detail_row = {
                     '批次编号': b['batch_id'],
                     '栋舍': b['barn_id'],
                     '进苗数量': b['chick_count'],
@@ -1729,7 +1786,16 @@ def batch_management_page():
                     '每只利润(元)': round(ind['profit_per_bird'], 2),
                     '日均风险评分': round(avg_risk, 2),
                     '峰值风险评分': round(peak_risk, 2),
-                })
+                }
+                if ind['predicted_feed_cost'] is not None:
+                    detail_row['预测饲料成本(元)'] = round(ind['predicted_feed_cost'], 2)
+                    if ind['profit_margin_change_pct'] is not None:
+                        margin_change = ind['profit_margin_change_pct']
+                        arrow = "↑" if margin_change >= 0 else "↓"
+                        detail_row['利润率影响(百分点)'] = f"{arrow}{abs(margin_change):.2f}"
+                    else:
+                        detail_row['利润率影响(百分点)'] = 'N/A'
+                details.append(detail_row)
 
         if details:
             fig = go.Figure()
@@ -1984,6 +2050,103 @@ def _check_constraints(nutrient_values, constraints):
     return results
 
 
+def _parse_price_history_csv(file_content):
+    """解析价格历史CSV文件"""
+    try:
+        df = pd.read_csv(file_content)
+        if df.shape[1] < 2:
+            return None, "CSV文件格式错误，需要至少两列：月份,单价"
+        df.columns = [str(c).strip() for c in df.columns]
+        month_col = None
+        price_col = None
+        for col in df.columns:
+            if '月' in col or '时间' in col or 'date' in col.lower():
+                month_col = col
+            elif '价' in col or 'price' in col.lower():
+                price_col = col
+        if month_col is None or price_col is None:
+            month_col = df.columns[0]
+            price_col = df.columns[1]
+        result_df = pd.DataFrame({
+            '月份': df[month_col].astype(str).str.strip(),
+            '单价': pd.to_numeric(df[price_col], errors='coerce')
+        })
+        result_df = result_df.dropna(subset=['单价'])
+        if len(result_df) == 0:
+            return None, "未解析到有效的价格数据"
+        return result_df, None
+    except Exception as e:
+        return None, f"CSV解析失败: {str(e)}"
+
+
+def _predict_next_month_price(history_df):
+    """使用线性回归(numpy.polyfit一次拟合)预测下一个月价格"""
+    if history_df is None or len(history_df) < 3:
+        return None, False
+    try:
+        months = list(range(len(history_df)))
+        prices = history_df['单价'].values.astype(float)
+        coeffs = np.polyfit(months, prices, 1)
+        next_month_idx = len(history_df)
+        predicted = np.polyval(coeffs, next_month_idx)
+        return float(predicted), True
+    except Exception:
+        return None, False
+
+
+def _get_price_warnings(ingredients_df, predicted_prices):
+    """检测价格涨幅超过15%的原料"""
+    warnings = []
+    if ingredients_df is None or len(ingredients_df) == 0:
+        return warnings
+    for _, row in ingredients_df.iterrows():
+        name = row['原料名称']
+        current_price = row['单价(元/kg)']
+        if name in predicted_prices and predicted_prices[name] is not None and current_price > 0:
+            predicted_price = predicted_prices[name]
+            increase_pct = ((predicted_price - current_price) / current_price) * 100
+            if increase_pct > 15:
+                warnings.append({
+                    'name': name,
+                    'current_price': current_price,
+                    'predicted_price': predicted_price,
+                    'increase_pct': increase_pct
+                })
+    return warnings
+
+
+def _analyze_prediction_conflict(ingredients_df, current_prices, predicted_prices, constraints):
+    """分析预测价格导致约束冲突的原因"""
+    info_parts = []
+    price_increases = []
+    for i, (_, row) in enumerate(ingredients_df.iterrows()):
+        name = row['原料名称']
+        current = current_prices[i]
+        if name in predicted_prices and predicted_prices[name] is not None:
+            predicted = predicted_prices[name]
+            increase_pct = ((predicted - current) / current * 100) if current > 0 else 0
+            if increase_pct > 10:
+                price_increases.append((name, increase_pct, current, predicted))
+    if price_increases:
+        price_increases.sort(key=lambda x: x[1], reverse=True)
+        info_parts.append("涨价幅度较大的原料:")
+        for name, pct, cur, pred in price_increases:
+            info_parts.append(f"  - {name}: +{pct:.1f}% (当前 {cur:.2f} → 预测 {pred:.2f})")
+    for col in NUTRIENT_COLS:
+        min_val = constraints[col]['min']
+        max_val = constraints[col]['max']
+        if min_val > max_val:
+            info_parts.append(f"约束冲突: {col} 最小值({min_val}) > 最大值({max_val})")
+    if info_parts:
+        info_parts.append("\n建议: 尝试放宽以下约束之一")
+        for col in NUTRIENT_COLS:
+            min_val = constraints[col]['min']
+            max_val = constraints[col]['max']
+            info_parts.append(f"  - {col}: 当前范围 [{min_val}, {max_val}]")
+        return "\n".join(info_parts)
+    return "建议尝试放宽营养约束范围，或调整原料库"
+
+
 def feed_formula_page():
     """饲料配方模拟与成本优化页面"""
     st.header("🥗 饲料配方模拟与成本优化")
@@ -1991,6 +2154,28 @@ def feed_formula_page():
 
     ingredients_df = _get_default_ingredients()
     constraints = _get_default_constraints()
+
+    predicted_prices = st.session_state.predicted_prices
+    price_warnings = _get_price_warnings(ingredients_df, predicted_prices)
+    if price_warnings:
+        warning_html_parts = [
+            '<div style="background-color: #FFA500; padding: 12px; border-radius: 6px; margin-bottom: 16px;">',
+            '<div style="font-weight: bold; font-size: 16px; color: #000; margin-bottom: 8px;">⚠️ 价格波动预警：以下原料预测涨幅超过15%</div>',
+            '<div style="display: flex; flex-wrap: wrap; gap: 8px;">'
+        ]
+        for w in price_warnings:
+            warning_html_parts.append(
+                f'<button onclick="document.querySelector(\'section[data-testid=stSidebar] ~ div [data-testid=stVerticalBlock] [data-testid=stExpanderDetails] [data-testid=stSelectbox] select option:contains({w["name"]})\').selected = true" '
+                f'style="background-color: #FFF; border: 1px solid #CC8400; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-weight: bold; color: #CC0000;">'
+                f'{w["name"]} +{w["increase_pct"]:.1f}%</button>'
+            )
+        warning_html_parts.append('</div></div>')
+        st.markdown(''.join(warning_html_parts), unsafe_allow_html=True)
+        for w in price_warnings:
+            if st.button(f"🔍 查看{w['name']}敏感性分析", key=f"warn_jump_{w['name']}"):
+                st.session_state['sen_ingredient_default'] = w['name']
+                st.session_state['sen_range_default'] = (-max(30, int(w['increase_pct'])), max(30, int(w['increase_pct'])))
+                st.rerun()
 
     st.subheader("📦 原料库管理")
 
@@ -2013,6 +2198,145 @@ def feed_formula_page():
 
     st.session_state.feed_ingredients = edited_df
     st.caption(f"当前原料总数: {len(edited_df)} 种")
+
+    with st.expander("📈 价格历史", expanded=False):
+        st.markdown("上传每种原料的近12个月历史价格(CSV格式: 月份,单价)，用于价格趋势预测。")
+        ingredient_names = edited_df['原料名称'].dropna().astype(str).str.strip().tolist()
+        ingredient_names = [n for n in ingredient_names if n]
+
+        price_history = st.session_state.ingredient_price_history
+        predicted_prices = {}
+
+        if ingredient_names:
+            for ing_name in ingredient_names:
+                col_up1, col_up2, col_up3 = st.columns([2, 1, 1])
+                with col_up1:
+                    st.markdown(f"**{ing_name}**")
+                with col_up2:
+                    history = price_history.get(ing_name, None)
+                    if history is not None:
+                        st.info(f"已导入 {len(history)} 条数据")
+                    else:
+                        st.info("暂无历史数据")
+                with col_up3:
+                    if history is not None:
+                        if st.button(f"清除", key=f"clear_hist_{ing_name}"):
+                            if ing_name in price_history:
+                                del price_history[ing_name]
+                                st.session_state.ingredient_price_history = price_history.copy()
+                                st.rerun()
+
+                col_f1, col_f2 = st.columns([2, 1])
+                with col_f1:
+                    uploaded = st.file_uploader(
+                        f"上传 {ing_name} 价格历史CSV",
+                        type=["csv"],
+                        key=f"price_upload_{ing_name}",
+                        label_visibility="collapsed"
+                    )
+                    if uploaded is not None:
+                        parsed_df, parse_error = _parse_price_history_csv(uploaded)
+                        if parse_error:
+                            st.error(parse_error)
+                        else:
+                            price_history[ing_name] = parsed_df
+                            st.session_state.ingredient_price_history = price_history.copy()
+                            st.success(f"✅ {ing_name} 价格历史导入成功，共 {len(parsed_df)} 条记录")
+                with col_f2:
+                    history = price_history.get(ing_name, None)
+                    if history is not None:
+                        pred_price, pred_ok = _predict_next_month_price(history)
+                        predicted_prices[ing_name] = pred_price if pred_ok else None
+                        if pred_ok:
+                            st.success(f"预测下月价格: {pred_price:.2f} 元/kg")
+                        else:
+                            st.warning("数据不足(需≥3个月)，无法预测")
+                    else:
+                        st.warning("未上传，跳过预测")
+
+            st.session_state.predicted_prices = predicted_prices
+
+            valid_histories = {name: hist for name, hist in price_history.items() if hist is not None and len(hist) > 0}
+            if valid_histories:
+                st.markdown("---")
+                st.markdown("**📊 价格趋势与预测**")
+                fig_prices = go.Figure()
+                colors = px.colors.qualitative.Plotly
+                for idx, (name, hist) in enumerate(valid_histories.items()):
+                    color = colors[idx % len(colors)]
+                    months_list = hist['月份'].tolist()
+                    prices_list = hist['单价'].tolist()
+                    has_prediction = name in predicted_prices and predicted_prices[name] is not None
+                    x_vals = list(range(len(months_list)))
+                    y_vals = prices_list
+
+                    fig_prices.add_trace(go.Scatter(
+                        x=x_vals,
+                        y=y_vals,
+                        mode='lines+markers',
+                        name=name,
+                        line=dict(color=color, width=2),
+                        marker=dict(size=8),
+                        hovertemplate=f'{name}<br>%{{text}}: %{{y:.2f}}元/kg<extra></extra>',
+                        text=months_list
+                    ))
+
+                    if has_prediction:
+                        pred_x = [len(months_list) - 1, len(months_list)]
+                        pred_y = [prices_list[-1], predicted_prices[name]]
+                        fig_prices.add_trace(go.Scatter(
+                            x=pred_x,
+                            y=pred_y,
+                            mode='lines+markers',
+                            name=f'{name}(预测)',
+                            line=dict(color=color, width=2, dash='dash'),
+                            marker=dict(size=10, symbol='diamond'),
+                            hovertemplate=f'{name}(预测)<br>%{{y:.2f}}元/kg<extra></extra>',
+                            showlegend=False
+                        ))
+                        fig_prices.add_annotation(
+                            x=len(months_list),
+                            y=predicted_prices[name],
+                            text=f"{predicted_prices[name]:.2f}",
+                            showarrow=True,
+                            arrowhead=2,
+                            ax=40,
+                            ay=0,
+                            bgcolor=color,
+                            font=dict(color='white', size=10)
+                        )
+                    else:
+                        if len(hist) < 3:
+                            fig_prices.add_annotation(
+                                x=len(months_list) - 1,
+                                y=prices_list[-1],
+                                text="数据不足",
+                                showarrow=False,
+                                bgcolor='#808080',
+                                font=dict(color='white', size=10),
+                                xshift=40
+                            )
+
+                fig_prices.update_layout(
+                    title='各原料价格走势与预测',
+                    xaxis_title='月份',
+                    yaxis_title='单价(元/kg)',
+                    height=450,
+                    hovermode='x unified',
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                if months_list:
+                    tick_positions = list(range(len(months_list)))
+                    fig_prices.update_xaxes(
+                        tickmode='array',
+                        tickvals=tick_positions,
+                        ticktext=months_list + ['预测下月'] if has_prediction else months_list
+                    )
+                st.plotly_chart(fig_prices, use_container_width=True)
+            else:
+                st.info("暂无已导入的价格历史数据")
+        else:
+            st.info("请先在原料库中添加原料")
 
     st.markdown("---")
     st.subheader("⚙️ 营养约束设置")
@@ -2085,6 +2409,56 @@ def feed_formula_page():
                     else:
                         st.error(f"❌ {error}")
                         st.info("💡 提示：请检查约束条件是否互相冲突，例如最小值大于最大值，或约束范围过窄导致无可行解")
+
+    with col_btn2:
+        if st.button("🔮 基于预测价格计算", **_st_btn_kwargs()):
+            with st.spinner("正在基于预测价格求解最优配方..."):
+                valid_ings = edited_df.dropna(subset=['原料名称', '单价(元/kg)'])
+                valid_ings = valid_ings[valid_ings['原料名称'].astype(str).str.strip() != '']
+                if len(valid_ings) == 0:
+                    st.error("❌ 请至少输入一种有效原料")
+                else:
+                    predicted_prices = st.session_state.predicted_prices
+                    predicted_ings = valid_ings.copy()
+                    current_prices = valid_ings['单价(元/kg)'].values.tolist()
+                    for i, (_, row) in enumerate(predicted_ings.iterrows()):
+                        name = row['原料名称']
+                        if name in predicted_prices and predicted_prices[name] is not None:
+                            predicted_ings.iloc[i, predicted_ings.columns.get_loc('单价(元/kg)')] = predicted_prices[name]
+
+                    amounts_pred, error_pred = _solve_feed_formula(predicted_ings.reset_index(drop=True), constraints)
+                    if amounts_pred is not None:
+                        nutrient_values_pred = _calculate_nutrient_values(predicted_ings.reset_index(drop=True), amounts_pred)
+                        constraint_checks_pred = _check_constraints(nutrient_values_pred, constraints)
+                        total_cost_pred = np.sum(predicted_ings['单价(元/kg)'].values * amounts_pred)
+                        unit_price_pred = total_cost_pred / 100.0
+
+                        amounts_curr, error_curr = _solve_feed_formula(valid_ings, constraints)
+                        total_cost_current = None
+                        if amounts_curr is not None:
+                            total_cost_current = np.sum(valid_ings['单价(元/kg)'].values * amounts_curr)
+
+                        result_data_pred = {
+                            'ingredients': predicted_ings.to_dict('records'),
+                            'original_ingredients': valid_ings.to_dict('records'),
+                            'amounts': amounts_pred.tolist(),
+                            'nutrient_values': nutrient_values_pred,
+                            'constraint_checks': constraint_checks_pred,
+                            'total_cost': total_cost_pred,
+                            'unit_price': unit_price_pred,
+                            'total_cost_current': total_cost_current,
+                            'used_predicted_prices': True,
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        }
+                        st.session_state.predicted_feed_formula_result = result_data_pred
+                        st.session_state.feed_formula_result = result_data_pred
+                        st.success("✅ 基于预测价格的最优配方计算成功!")
+                    else:
+                        conflict_analysis = _analyze_prediction_conflict(
+                            valid_ings, current_prices, predicted_prices, constraints
+                        )
+                        st.error(f"❌ {error_pred}")
+                        st.warning(f"🔍 冲突分析:\n{conflict_analysis}")
 
     st.markdown("---")
 
@@ -2191,41 +2565,92 @@ def feed_formula_page():
 
         st.markdown("---")
 
+        used_predicted = result.get('used_predicted_prices', False)
+        total_cost_current = result.get('total_cost_current', None)
+
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         with col_m1:
-            st.metric("配方总成本", f"{total_cost:.2f} 元/100kg", delta_color="inverse")
+            if used_predicted:
+                label_prefix = "预测价格配方成本"
+            else:
+                label_prefix = "配方总成本"
+            st.metric(label_prefix, f"{total_cost:.2f} 元/100kg", delta_color="inverse")
         with col_m2:
-            st.metric("饲料单价", f"{unit_price:.2f} 元/kg", delta_color="inverse")
+            if used_predicted:
+                label_prefix = "预测饲料单价"
+            else:
+                label_prefix = "饲料单价"
+            st.metric(label_prefix, f"{unit_price:.2f} 元/kg", delta_color="inverse")
+
         with col_m3:
             apply_to_batch = st.toggle(
                 "应用到批次计算",
-                value=st.session_state.global_feed_unit_price == unit_price,
+                value=(st.session_state.global_feed_unit_price == unit_price) or
+                      (used_predicted and st.session_state.global_feed_unit_price_predicted == unit_price),
             )
             if apply_to_batch:
-                st.session_state.global_feed_unit_price = unit_price
-                st.success("✅ 已应用到批次计算")
+                if used_predicted:
+                    st.session_state.global_feed_unit_price = unit_price
+                    st.session_state.global_feed_unit_price_predicted = unit_price
+                    st.success("✅ 当前单价和预测单价均已应用到批次计算")
+                else:
+                    st.session_state.global_feed_unit_price = unit_price
+                    st.success("✅ 已应用到批次计算")
             else:
                 if st.session_state.global_feed_unit_price != DEFAULT_FEED_UNIT_PRICE:
                     st.session_state.global_feed_unit_price = DEFAULT_FEED_UNIT_PRICE
+                if st.session_state.global_feed_unit_price_predicted is not None:
+                    st.session_state.global_feed_unit_price_predicted = None
         with col_m4:
-            st.info(f"当前批次模块单价: {st.session_state.global_feed_unit_price:.2f} 元/kg")
+            info_text = f"当前批次模块单价: {st.session_state.global_feed_unit_price:.2f} 元/kg"
+            if st.session_state.global_feed_unit_price_predicted is not None:
+                info_text += f"\n预测批次单价: {st.session_state.global_feed_unit_price_predicted:.2f} 元/kg"
+            st.info(info_text)
+
+        if used_predicted and total_cost_current is not None:
+            diff_pct = ((total_cost - total_cost_current) / total_cost_current) * 100 if total_cost_current > 0 else 0
+            diff_color = "inverse" if diff_pct > 0 else "normal"
+            delta_text = f"{diff_pct:+.2f}%"
+            st.markdown("---")
+            col_cmp1, col_cmp2, col_cmp3 = st.columns(3)
+            with col_cmp1:
+                st.metric("当前价格配方成本", f"{total_cost_current:.2f} 元/100kg", delta_color="inverse")
+            with col_cmp2:
+                st.metric("预测价格配方成本", f"{total_cost:.2f} 元/100kg", delta=delta_text, delta_color=diff_color)
+            with col_cmp3:
+                direction = "上涨" if diff_pct > 0 else "下降"
+                arrow = "⬆️" if diff_pct > 0 else "⬇️"
+                st.metric("成本变化", f"{arrow} {abs(diff_pct):.2f}%", delta_color=diff_color)
+                st.caption(f"预测下月配方成本较当前{direction} {abs(diff_pct):.2f}%")
 
         st.markdown("---")
         st.subheader("📈 敏感性分析")
 
         if len(valid_ings) > 0:
             sen_col1, sen_col2, sen_col3 = st.columns([1, 1, 1])
+
+            default_sen_idx = 0
+            if 'sen_ingredient_default' in st.session_state:
+                default_name = st.session_state.pop('sen_ingredient_default')
+                if default_name in valid_ings['原料名称'].tolist():
+                    default_sen_idx = valid_ings['原料名称'].tolist().index(default_name)
+
+            default_sen_range = (-30, 50)
+            if 'sen_range_default' in st.session_state:
+                default_sen_range = st.session_state.pop('sen_range_default')
+
             with sen_col1:
                 sen_ingredient = st.selectbox(
                     "选择原料",
                     valid_ings['原料名称'].tolist(),
+                    index=default_sen_idx,
                     key="sen_ingredient")
             with sen_col2:
                 price_range_min = st.slider(
                     "价格波动范围(%)",
                     min_value=-50,
                     max_value=100,
-                    value=(-30, 50),
+                    value=default_sen_range,
                     step=5,
                     key="sen_range")
             with sen_col3:
