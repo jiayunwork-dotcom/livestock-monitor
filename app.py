@@ -1262,6 +1262,61 @@ def _calculate_feed_cost(barn_id, start_date, end_date):
     return total_feed, feed_cost, data_incomplete
 
 
+def _calculate_batch_health_score(batch, livestock_type='肉鸡', total_livestock=10000):
+    if batch.get('status') != '已出栏':
+        return None
+
+    barn_id = batch['barn_id']
+    start_date = batch['start_date']
+    end_date = batch['slaughter_date']
+
+    env_df = st.session_state.env_data
+    prod_df = st.session_state.prod_data
+
+    if env_df is None or prod_df is None:
+        return None
+
+    env_df_copy = env_df.copy()
+    prod_df_copy = prod_df.copy()
+    env_df_copy['时间戳'] = pd.to_datetime(env_df_copy['时间戳'])
+    prod_df_copy['时间戳'] = pd.to_datetime(prod_df_copy['时间戳'])
+
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+
+    env_filtered = env_df_copy[
+        (env_df_copy['栋舍编号'] == barn_id) &
+        (env_df_copy['时间戳'] >= start_ts) &
+        (env_df_copy['时间戳'] <= end_ts)
+    ]
+    prod_filtered = prod_df_copy[
+        (prod_df_copy['栋舍编号'] == barn_id) &
+        (prod_df_copy['时间戳'] >= start_ts) &
+        (prod_df_copy['时间戳'] <= end_ts)
+    ]
+
+    if env_filtered.empty or prod_filtered.empty:
+        return None
+
+    from utils.disease_warning import calculate_daily_risk_timeline
+
+    timeline_df = calculate_daily_risk_timeline(
+        env_filtered, prod_filtered, barn_id, livestock_type, total_livestock
+    )
+
+    if timeline_df.empty:
+        return None
+
+    risk_scores = timeline_df['风险评分'].values
+    avg_risk = np.mean(risk_scores)
+    peak_risk = np.max(risk_scores)
+
+    return {
+        'avg_risk': round(avg_risk, 2),
+        'peak_risk': round(peak_risk, 2),
+    }
+
+
 def _calculate_economic_indicators(batch):
     if batch.get('status') != '已出栏':
         return None
@@ -1305,6 +1360,62 @@ def _calculate_economic_indicators(batch):
         'total_feed': total_feed,
         'data_incomplete': data_incomplete,
     }
+
+
+def _get_sort_key(batch, sort_by):
+    if sort_by == "添加时间":
+        return 0
+    elif sort_by == "成活率":
+        if batch['status'] != '已出栏':
+            return -1
+        ind = _calculate_economic_indicators(batch)
+        return ind['survival_rate'] if ind else -1
+    elif sort_by == "料肉比":
+        if batch['status'] != '已出栏':
+            return 999
+        ind = _calculate_economic_indicators(batch)
+        return ind['fcr'] if ind and ind['fcr'] is not None else 999
+    elif sort_by == "每只利润":
+        if batch['status'] != '已出栏':
+            return -999999
+        ind = _calculate_economic_indicators(batch)
+        return ind['profit_per_bird'] if ind else -999999
+    return 0
+
+
+def _export_batches_csv():
+    batches = st.session_state.batches
+    completed_batches = [b for b in batches if b['status'] == '已出栏']
+    if not completed_batches:
+        return None
+
+    export_data = []
+    for b in completed_batches:
+        ind = _calculate_economic_indicators(b)
+        health = _calculate_batch_health_score(b)
+        row = {
+            '批次编号': b['batch_id'],
+            '栋舍': b['barn_id'],
+            '进苗数量': b['chick_count'],
+            '出栏数量': b['slaughter_count'],
+            '苗鸡成本': round(ind['chick_cost'], 2) if ind else '',
+            '饲料成本': round(ind['feed_cost'], 2) if ind else '',
+            '其他成本': round(ind['other_cost'], 2) if ind else '',
+            '总投入': round(ind['total_cost'], 2) if ind else '',
+            '总收入': round(ind['total_revenue'], 2) if ind else '',
+            '利润': round(ind['profit'], 2) if ind else '',
+            '料肉比': round(ind['fcr'], 3) if ind and ind['fcr'] is not None else '',
+            '成活率': round(ind['survival_rate'], 1) if ind else '',
+            '每只利润': round(ind['profit_per_bird'], 2) if ind else '',
+            '日均风险评分': health['avg_risk'] if health else '',
+            '峰值风险评分': health['peak_risk'] if health else '',
+        }
+        export_data.append(row)
+
+    df = pd.DataFrame(export_data)
+    output = io.BytesIO()
+    df.to_csv(output, index=False, encoding='utf-8-sig')
+    return output.getvalue()
 
 
 def batch_management_page():
@@ -1362,6 +1473,7 @@ def batch_management_page():
                 'slaughter_count': None,
                 'avg_slaughter_weight': None,
                 'sale_price': None,
+                'created_at': datetime.now(),
             }
             st.session_state.batches.append(new_batch)
             st.success(f"✅ 批次 {next_id} 添加成功!")
@@ -1375,7 +1487,34 @@ def batch_management_page():
         st.info("暂无批次信息，请先添加批次")
         return
 
-    for i, batch in enumerate(batches):
+    col_filter1, col_filter2 = st.columns(2)
+    with col_filter1:
+        status_filter = st.selectbox(
+            "状态筛选",
+            ["全部", "养殖中", "已出栏"],
+            key="batch_status_filter"
+        )
+    with col_filter2:
+        sort_by = st.selectbox(
+            "排序方式",
+            ["添加时间", "成活率", "料肉比", "每只利润"],
+            key="batch_sort_by"
+        )
+
+    if status_filter != "全部":
+        display_batches = [b for b in batches if b['status'] == status_filter]
+    else:
+        display_batches = batches.copy()
+
+    if sort_by != "添加时间":
+        if sort_by == "料肉比":
+            display_batches.sort(key=lambda b: _get_sort_key(b, sort_by), reverse=False)
+        else:
+            display_batches.sort(key=lambda b: _get_sort_key(b, sort_by), reverse=True)
+
+    for i, batch in enumerate(display_batches):
+        original_idx = next((idx for idx, b in enumerate(batches) if b['batch_id'] == batch['batch_id']), i)
+
         with st.container():
             status = batch['status']
             if status == '养殖中':
@@ -1410,19 +1549,19 @@ def batch_management_page():
 
             if status == '养殖中':
                 with st.expander(f"📝 登记出栏 [{batch['batch_id']}]"):
-                    with st.form(f"slaughter_form_{i}"):
+                    with st.form(f"slaughter_form_{batch['batch_id']}"):
                         sc1, sc2 = st.columns(2)
                         with sc1:
                             s_date = st.date_input(
                                 "实际出栏日期",
                                 value=datetime.now(),
-                                key=f"s_date_{i}"
+                                key=f"s_date_{batch['batch_id']}"
                             )
                             s_count = st.number_input(
                                 "实际出栏数量(只)",
                                 min_value=1,
                                 step=10,
-                                key=f"s_count_{i}"
+                                key=f"s_count_{batch['batch_id']}"
                             )
                         with sc2:
                             s_weight = st.number_input(
@@ -1431,7 +1570,7 @@ def batch_management_page():
                                 value=2.5,
                                 step=0.1,
                                 format="%.2f",
-                                key=f"s_weight_{i}"
+                                key=f"s_weight_{batch['batch_id']}"
                             )
                             s_price = st.number_input(
                                 "毛鸡销售单价(元/kg)",
@@ -1439,7 +1578,7 @@ def batch_management_page():
                                 value=10.0,
                                 step=0.1,
                                 format="%.2f",
-                                key=f"s_price_{i}"
+                                key=f"s_price_{batch['batch_id']}"
                             )
 
                         s_submitted = st.form_submit_button("确认出栏", type="primary")
@@ -1458,11 +1597,11 @@ def batch_management_page():
                                 st.error(f"❌ {err}")
 
                         if s_submitted and not s_errors:
-                            st.session_state.batches[i]['status'] = '已出栏'
-                            st.session_state.batches[i]['slaughter_date'] = s_date
-                            st.session_state.batches[i]['slaughter_count'] = int(s_count)
-                            st.session_state.batches[i]['avg_slaughter_weight'] = s_weight
-                            st.session_state.batches[i]['sale_price'] = s_price
+                            st.session_state.batches[original_idx]['status'] = '已出栏'
+                            st.session_state.batches[original_idx]['slaughter_date'] = s_date
+                            st.session_state.batches[original_idx]['slaughter_count'] = int(s_count)
+                            st.session_state.batches[original_idx]['avg_slaughter_weight'] = s_weight
+                            st.session_state.batches[original_idx]['sale_price'] = s_price
                             st.success(f"✅ 批次 {batch['batch_id']} 出栏登记成功!")
                             st.rerun()
 
@@ -1470,31 +1609,47 @@ def batch_management_page():
                 indicators = _calculate_economic_indicators(batch)
                 if indicators:
                     st.markdown("**💰 经济指标**")
-                    ic1, ic2, ic3, ic4 = st.columns(4)
+                    ic1, ic2, ic3 = st.columns(3)
                     incomplete_suffix = " (数据不完整,仅供参考)" if indicators['data_incomplete'] else ""
 
+                    total_cost = indicators['total_cost']
+                    chick_cost = indicators['chick_cost']
+                    feed_cost = indicators['feed_cost']
+                    other_cost = indicators['other_cost']
+
+                    chick_pct = (chick_cost / total_cost * 100) if total_cost > 0 else 0
+                    feed_pct = (feed_cost / total_cost * 100) if total_cost > 0 else 0
+                    other_pct = (other_cost / total_cost * 100) if total_cost > 0 else 0
+
                     with ic1:
-                        total_cost_label = f"总投入{incomplete_suffix}"
-                        st.metric(total_cost_label, f"{indicators['total_cost']:.2f} 元")
-                        st.metric("苗鸡成本", f"{indicators['chick_cost']:.2f} 元")
-                    with ic2:
                         st.metric("总收入", f"{indicators['total_revenue']:.2f} 元")
-                        feed_cost_label = f"饲料成本{incomplete_suffix}"
-                        st.metric(feed_cost_label, f"{indicators['feed_cost']:.2f} 元")
-                    with ic3:
-                        profit_label = f"利润{incomplete_suffix}"
+                        st.markdown(f"**苗鸡成本**: {chick_cost:.2f} 元, 占比{chick_pct:.1f}%")
+                        st.markdown(f"**饲料成本**{incomplete_suffix}: {feed_cost:.2f} 元, 占比{feed_pct:.1f}%")
+                        st.markdown(f"**其他成本**: {other_cost:.2f} 元, 占比{other_pct:.1f}%")
+                    with ic2:
+                        total_cost_label = f"**总投入**{incomplete_suffix}"
+                        st.markdown(f"{total_cost_label}: {total_cost:.2f} 元")
                         profit_val = indicators['profit']
-                        st.metric(profit_label, f"{profit_val:.2f} 元",
-                                  delta=f"{'盈利' if profit_val >= 0 else '亏损'}")
+                        profit_label = f"**利润**{incomplete_suffix}"
+                        st.markdown(f"{profit_label}: {profit_val:.2f} 元 ({'盈利' if profit_val >= 0 else '亏损'})")
                         if indicators['fcr'] is not None:
-                            fcr_label = f"料肉比{incomplete_suffix}"
-                            st.metric(fcr_label, f"{indicators['fcr']:.3f}")
+                            fcr_label = f"**料肉比**{incomplete_suffix}"
+                            st.markdown(f"{fcr_label}: {indicators['fcr']:.3f}")
                         else:
-                            st.metric("料肉比", "N/A")
-                    with ic4:
-                        st.metric("成活率", f"{indicators['survival_rate']:.1f}%")
-                        ppb_label = f"每只利润{incomplete_suffix}"
-                        st.metric(ppb_label, f"{indicators['profit_per_bird']:.2f} 元")
+                            st.markdown("**料肉比**: N/A")
+                    with ic3:
+                        st.markdown(f"**成活率**: {indicators['survival_rate']:.1f}%")
+                        ppb_label = f"**每只利润**{incomplete_suffix}"
+                        st.markdown(f"{ppb_label}: {indicators['profit_per_bird']:.2f} 元")
+
+                        health_score = _calculate_batch_health_score(batch)
+                        if health_score:
+                            avg_risk = health_score['avg_risk']
+                            peak_risk = health_score['peak_risk']
+                            warning_icon = " ⚠️" if avg_risk > 0.5 else ""
+                            st.markdown(f"**健康评分**: {avg_risk:.2f}/{peak_risk:.2f}{warning_icon}")
+                        else:
+                            st.markdown("**健康评分**: 暂无数据")
 
                     if indicators['data_incomplete']:
                         st.warning("⚠️ 饲料数据不完整(覆盖天数不足养殖周期80%)，以上含\"数据不完整,仅供参考\"标注的指标仅供参考")
@@ -1509,28 +1664,47 @@ def batch_management_page():
         fcr_list = []
         survival_list = []
         profit_per_bird_list = []
+        avg_risk_list = []
+        peak_risk_list = []
         details = []
 
         for b in completed_batches:
             ind = _calculate_economic_indicators(b)
+            health = _calculate_batch_health_score(b)
             if ind:
                 fcr_list.append(ind['fcr'])
                 survival_list.append(ind['survival_rate'])
                 profit_per_bird_list.append(ind['profit_per_bird'])
+
+                avg_risk = health['avg_risk'] if health else 0
+                peak_risk = health['peak_risk'] if health else 0
+                avg_risk_list.append(avg_risk)
+                peak_risk_list.append(peak_risk)
+
+                total_cost = ind['total_cost']
+                chick_cost = ind['chick_cost']
+                feed_cost = ind['feed_cost']
+                other_cost = ind['other_cost']
+                chick_pct = (chick_cost / total_cost * 100) if total_cost > 0 else 0
+                feed_pct = (feed_cost / total_cost * 100) if total_cost > 0 else 0
+                other_pct = (other_cost / total_cost * 100) if total_cost > 0 else 0
+
                 details.append({
                     '批次编号': b['batch_id'],
                     '栋舍': b['barn_id'],
                     '进苗数量': b['chick_count'],
                     '出栏数量': b['slaughter_count'],
-                    '苗鸡成本(元)': round(ind['chick_cost'], 2),
-                    '饲料成本(元)': round(ind['feed_cost'], 2),
-                    '其他成本(元)': round(ind['other_cost'], 2),
+                    '苗鸡成本(元)': f"{chick_cost:.2f} ({chick_pct:.1f}%)",
+                    '饲料成本(元)': f"{feed_cost:.2f} ({feed_pct:.1f}%)",
+                    '其他成本(元)': f"{other_cost:.2f} ({other_pct:.1f}%)",
                     '总投入(元)': round(ind['total_cost'], 2),
                     '总收入(元)': round(ind['total_revenue'], 2),
                     '利润(元)': round(ind['profit'], 2),
                     '料肉比': round(ind['fcr'], 3) if ind['fcr'] is not None else 'N/A',
                     '成活率(%)': round(ind['survival_rate'], 1),
                     '每只利润(元)': round(ind['profit_per_bird'], 2),
+                    '日均风险评分': round(avg_risk, 2),
+                    '峰值风险评分': round(peak_risk, 2),
                 })
 
         if details:
@@ -1566,6 +1740,15 @@ def batch_management_page():
                 textposition='auto',
             ))
 
+            fig.add_trace(go.Bar(
+                name='日均风险评分',
+                x=batch_ids,
+                y=avg_risk_list,
+                marker_color='#808080',
+                text=[f'{v:.2f}' for v in avg_risk_list],
+                textposition='auto',
+            ))
+
             fig.update_layout(
                 title='各批次核心指标对比',
                 xaxis_title='批次编号',
@@ -1581,6 +1764,7 @@ def batch_management_page():
             worst_fcr_idx = None
             worst_survival_idx = None
             worst_profit_idx = None
+            worst_risk_idx = None
 
             valid_fcr = [(i, v) for i, v in enumerate(fcr_list) if v is not None and v > 0]
             if valid_fcr:
@@ -1592,6 +1776,9 @@ def batch_management_page():
             if profit_per_bird_list:
                 worst_profit_idx = profit_per_bird_list.index(min(profit_per_bird_list))
 
+            if avg_risk_list:
+                worst_risk_idx = avg_risk_list.index(max(avg_risk_list))
+
             worst_cells = []
             if worst_fcr_idx is not None:
                 worst_cells.append((worst_fcr_idx, '料肉比'))
@@ -1599,6 +1786,8 @@ def batch_management_page():
                 worst_cells.append((worst_survival_idx, '成活率(%)'))
             if worst_profit_idx is not None:
                 worst_cells.append((worst_profit_idx, '每只利润(元)'))
+            if worst_risk_idx is not None:
+                worst_cells.append((worst_risk_idx, '日均风险评分'))
 
             def apply_cell_highlight(df):
                 result = pd.DataFrame('', index=df.index, columns=df.columns)
@@ -1609,6 +1798,23 @@ def batch_management_page():
 
             styled_df = detail_df.style.apply(apply_cell_highlight, axis=None)
             st.dataframe(styled_df, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        col_export1, col_export2 = st.columns([3, 1])
+        with col_export2:
+            csv_data = _export_batches_csv()
+            if csv_data:
+                filename = f"批次报表_{datetime.now().strftime('%Y%m%d')}.csv"
+                st.download_button(
+                    label="📥 导出批次报表",
+                    data=csv_data,
+                    file_name=filename,
+                    mime="text/csv",
+                    type="primary",
+                    **_st_btn_kwargs()
+                )
+            else:
+                st.button("📥 导出批次报表", disabled=True, **_st_btn_kwargs())
 
 
 def report_page(livestock_type, total_livestock):
