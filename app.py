@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import io
+from scipy.optimize import linprog
 
 from utils.data_validator import validate_environment_data, validate_production_data, check_barn_continuity, check_energy_columns
 from utils.comfort_eval import (
@@ -112,6 +113,12 @@ def init_session_state():
         'current_page': "📥 数据导入",
         'warning_tickets': [],
         'batches': [],
+        'global_feed_unit_price': 2.8,
+        'feed_ingredients': None,
+        'feed_constraints': None,
+        'feed_formula_result': None,
+        'saved_formulas': [],
+        'sensitivity_result': None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -154,6 +161,7 @@ def main():
         "💀 死亡率分析",
         "📊 多栋舍对比",
         "📋 养殖批次管理与经济效益分析",
+        "🥗 饲料配方模拟与成本优化",
         "📄 报告导出"
     ]
     
@@ -190,6 +198,8 @@ def main():
         comparison_page(livestock_type, total_livestock)
     elif page == "📋 养殖批次管理与经济效益分析":
         batch_management_page()
+    elif page == "🥗 饲料配方模拟与成本优化":
+        feed_formula_page()
     elif page == "📄 报告导出":
         report_page(livestock_type, total_livestock)
 
@@ -1202,9 +1212,14 @@ def comparison_page(livestock_type, total_livestock):
         st.success("各栋舍环境参数差异较小，整体运行良好")
 
 
-FEED_UNIT_PRICE = 2.8
+DEFAULT_FEED_UNIT_PRICE = 2.8
 OTHER_COST_PER_BIRD = 2.0
 INITIAL_WEIGHT_KG = 0.04
+
+
+def _get_feed_unit_price():
+    """获取饲料单价，优先使用session_state中的全局值"""
+    return st.session_state.get('global_feed_unit_price', DEFAULT_FEED_UNIT_PRICE)
 
 
 def _get_barn_list():
@@ -1252,7 +1267,8 @@ def _calculate_feed_cost(barn_id, start_date, end_date):
         return None, 0.0, True
 
     total_feed = barn_data['日采食量(kg)'].sum()
-    feed_cost = total_feed * FEED_UNIT_PRICE
+    feed_unit_price = _get_feed_unit_price()
+    feed_cost = total_feed * feed_unit_price
 
     total_days = (end_ts - start_ts).days + 1
     covered_days = barn_data['时间戳'].dt.date.nunique()
@@ -1420,6 +1436,14 @@ def _export_batches_csv():
 
 def batch_management_page():
     st.header("📋 养殖批次管理与经济效益分析")
+    st.markdown("---")
+
+    current_feed_price = _get_feed_unit_price()
+    if current_feed_price != DEFAULT_FEED_UNIT_PRICE:
+        st.info(f"💡 当前饲料单价: **{current_feed_price:.2f} 元/kg** (由「饲料配方模拟与成本优化」模块提供)")
+    else:
+        st.info(f"💡 当前饲料单价: **{current_feed_price:.2f} 元/kg** (默认值，可在「饲料配方模拟与成本优化」模块中调整)")
+    
     st.markdown("---")
 
     barns = _get_barn_list()
@@ -1815,6 +1839,609 @@ def batch_management_page():
                 )
             else:
                 st.button("📥 导出批次报表", disabled=True, **_st_btn_kwargs())
+
+
+DEFAULT_INGREDIENTS = [
+    {'原料名称': '玉米', '单价(元/kg)': 2.8, '粗蛋白(%)': 8.5, '粗脂肪(%)': 3.5, '粗纤维(%)': 2.0, '钙(%)': 0.02, '磷(%)': 0.27, '代谢能(kcal/kg)': 3200},
+    {'原料名称': '豆粕', '单价(元/kg)': 4.2, '粗蛋白(%)': 43.0, '粗脂肪(%)': 1.0, '粗纤维(%)': 5.0, '钙(%)': 0.32, '磷(%)': 0.62, '代谢能(kcal/kg)': 2450},
+    {'原料名称': '鱼粉', '单价(元/kg)': 12.0, '粗蛋白(%)': 62.0, '粗脂肪(%)': 10.0, '粗纤维(%)': 1.0, '钙(%)': 3.96, '磷(%)': 2.85, '代谢能(kcal/kg)': 2900},
+    {'原料名称': '麦麸', '单价(元/kg)': 1.6, '粗蛋白(%)': 15.0, '粗脂肪(%)': 4.0, '粗纤维(%)': 9.0, '钙(%)': 0.18, '磷(%)': 0.78, '代谢能(kcal/kg)': 1650},
+    {'原料名称': '石粉', '单价(元/kg)': 0.5, '粗蛋白(%)': 0.0, '粗脂肪(%)': 0.0, '粗纤维(%)': 0.0, '钙(%)': 38.0, '磷(%)': 0.0, '代谢能(kcal/kg)': 0},
+]
+
+DEFAULT_CONSTRAINTS = {
+    '粗蛋白(%)': {'min': 18.0, 'max': 23.0},
+    '粗脂肪(%)': {'min': 3.0, 'max': 8.0},
+    '粗纤维(%)': {'min': 2.0, 'max': 5.0},
+    '钙(%)': {'min': 0.8, 'max': 1.2},
+    '磷(%)': {'min': 0.4, 'max': 0.7},
+    '代谢能(kcal/kg)': {'min': 2800.0, 'max': 3200.0},
+}
+
+NUTRIENT_COLS = ['粗蛋白(%)', '粗脂肪(%)', '粗纤维(%)', '钙(%)', '磷(%)', '代谢能(kcal/kg)']
+
+
+def _get_default_ingredients():
+    if st.session_state.feed_ingredients is None:
+        st.session_state.feed_ingredients = pd.DataFrame(DEFAULT_INGREDIENTS)
+    return st.session_state.feed_ingredients
+
+
+def _get_default_constraints():
+    if st.session_state.feed_constraints is None:
+        st.session_state.feed_constraints = DEFAULT_CONSTRAINTS.copy()
+    return st.session_state.feed_constraints
+
+
+def _solve_feed_formula(ingredients_df, constraints):
+    n = len(ingredients_df)
+    if n == 0:
+        return None, "请先添加至少一种原料"
+
+    prices = ingredients_df['单价(元/kg)'].values
+    nutrient_matrix = ingredients_df[NUTRIENT_COLS].values
+
+    c = prices
+
+    A_ub = []
+    b_ub = []
+
+    for i, col in enumerate(NUTRIENT_COLS):
+        min_val = constraints[col]['min']
+        max_val = constraints[col]['max']
+
+        if max_val is not None:
+            A_ub.append(nutrient_matrix[:, i])
+            b_ub.append(max_val * 100.0)
+
+        if min_val is not None:
+            A_ub.append(-nutrient_matrix[:, i])
+            b_ub.append(-min_val * 100.0)
+
+    A_eq = [np.ones(n)]
+    b_eq = [100.0]
+
+    bounds = [(0.0, 80.0) for _ in range(n)]
+
+    try:
+        result = linprog(
+            c,
+            A_ub=np.array(A_ub),
+            b_ub=np.array(b_ub),
+            A_eq=np.array(A_eq),
+            b_eq=np.array(b_eq),
+            bounds=bounds,
+            method='highs'
+        )
+
+        if result.success:
+            return result.x, None
+        else:
+            conflict_info = _analyze_constraint_conflict(ingredients_df, constraints)
+            return None, f"求解失败: {result.message}\n{conflict_info}"
+    except Exception as e:
+        return None, f"求解出错: {str(e)}"
+
+
+def _analyze_constraint_conflict(ingredients_df, constraints):
+    conflict_info = []
+    for col in NUTRIENT_COLS:
+        min_val = constraints[col]['min']
+        max_val = constraints[col]['max']
+        if min_val > max_val:
+            conflict_info.append(f"- {col}: 最小值({min_val}) > 最大值({max_val})")
+    
+    max_nutrients = ingredients_df[NUTRIENT_COLS].max()
+    min_nutrients = ingredients_df[NUTRIENT_COLS].min()
+    
+    for col in NUTRIENT_COLS:
+        min_val = constraints[col]['min']
+        max_val = constraints[col]['max']
+        max_possible = max_nutrients[col]
+        min_possible = min_nutrients[col]
+        if min_val > max_possible:
+            conflict_info.append(f"- {col}: 约束最小值({min_val}) > 所有原料最高含量({max_possible})")
+        if max_val < min_possible:
+            conflict_info.append(f"- {col}: 约束最大值({max_val}) < 所有原料最低含量({min_possible})")
+    
+    if conflict_info:
+        return "可能的约束冲突:\n" + "\n".join(conflict_info)
+    return "请尝试调整约束范围或原料配方"
+
+
+def _calculate_nutrient_values(ingredients_df, amounts):
+    result = {}
+    total = sum(amounts)
+    if total <= 0:
+        return result
+
+    for col in NUTRIENT_COLS:
+        values = ingredients_df[col].values
+        weighted = np.sum(values * amounts) / total
+        result[col] = round(weighted, 4)
+    return result
+
+
+def _check_constraints(nutrient_values, constraints):
+    results = {}
+    for col in NUTRIENT_COLS:
+        actual = nutrient_values.get(col, 0)
+        min_val = constraints[col]['min']
+        max_val = constraints[col]['max']
+        is_met = (actual >= min_val - 1e-6) and (actual <= max_val + 1e-6)
+        deviation = 0
+        if actual < min_val:
+            deviation = actual - min_val
+        elif actual > max_val:
+            deviation = actual - max_val
+        results[col] = {
+            'met': is_met,
+            'actual': actual,
+            'min': min_val,
+            'max': max_val,
+            'deviation': deviation
+        }
+    return results
+
+
+def feed_formula_page():
+    """饲料配方模拟与成本优化页面"""
+    st.header("🥗 饲料配方模拟与成本优化")
+    st.markdown("---")
+
+    ingredients_df = _get_default_ingredients()
+    constraints = _get_default_constraints()
+
+    st.subheader("📦 原料库管理")
+
+    edited_df = st.data_editor(
+        ingredients_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "原料名称": st.column_config.TextColumn("原料名称", required=True),
+            "单价(元/kg)": st.column_config.NumberColumn("单价(元/kg)", min_value=0.0, step=0.1, format="%.2f"),
+            "粗蛋白(%)": st.column_config.NumberColumn("粗蛋白(%)", min_value=0.0, max_value=100.0, step=0.1, format="%.1f"),
+            "粗脂肪(%)": st.column_config.NumberColumn("粗脂肪(%)", min_value=0.0, max_value=100.0, step=0.1, format="%.1f"),
+            "粗纤维(%)": st.column_config.NumberColumn("粗纤维(%)", min_value=0.0, max_value=100.0, step=0.1, format="%.1f"),
+            "钙(%)": st.column_config.NumberColumn("钙(%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f"),
+            "磷(%)": st.column_config.NumberColumn("磷(%)", min_value=0.0, max_value=100.0, step=0.01, format="%.2f"),
+            "代谢能(kcal/kg)": st.column_config.NumberColumn("代谢能(kcal/kg)", min_value=0, step=10, format="%.0f"),
+        },
+        key="ingredients_editor"
+    )
+
+    st.session_state.feed_ingredients = edited_df
+    st.caption(f"当前原料总数: {len(edited_df)} 种")
+
+    st.markdown("---")
+    st.subheader("⚙️ 营养约束设置")
+
+    col_c1, col_c2 = st.columns(2)
+
+    with col_c1:
+        col_name = '粗蛋白(%)'
+        cp_min = st.number_input(f"{col_name} 最小值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['min']), step=0.1, key=f"{col_name}_min")
+        cp_max = st.number_input(f"{col_name} 最大值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['max']), step=0.1, key=f"{col_name}_max")
+        constraints[col_name] = {'min': cp_min, 'max': cp_max}
+
+        col_name = '粗脂肪(%)'
+        ee_min = st.number_input(f"{col_name} 最小值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['min']), step=0.1, key=f"{col_name}_min")
+        ee_max = st.number_input(f"{col_name} 最大值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['max']), step=0.1, key=f"{col_name}_max")
+        constraints[col_name] = {'min': ee_min, 'max': ee_max}
+
+        col_name = '粗纤维(%)'
+        cf_min = st.number_input(f"{col_name} 最小值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['min']), step=0.1, key=f"{col_name}_min")
+        cf_max = st.number_input(f"{col_name} 最大值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['max']), step=0.1, key=f"{col_name}_max")
+        constraints[col_name] = {'min': cf_min, 'max': cf_max}
+
+    with col_c2:
+        col_name = '钙(%)'
+        ca_min = st.number_input(f"{col_name} 最小值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['min']), step=0.01, key=f"{col_name}_min")
+        ca_max = st.number_input(f"{col_name} 最大值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['max']), step=0.01, key=f"{col_name}_max")
+        constraints[col_name] = {'min': ca_min, 'max': ca_max}
+
+        col_name = '磷(%)'
+        p_min = st.number_input(f"{col_name} 最小值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['min']), step=0.01, key=f"{col_name}_min")
+        p_max = st.number_input(f"{col_name} 最大值(%)", min_value=0.0, max_value=100.0, value=float(constraints[col_name]['max']), step=0.01, key=f"{col_name}_max")
+        constraints[col_name] = {'min': p_min, 'max': p_max}
+
+        col_name = '代谢能(kcal/kg)'
+        me_min = st.number_input(f"{col_name} 最小值", min_value=0, max_value=5000, value=int(constraints[col_name]['min']), step=50, key=f"{col_name}_min")
+        me_max = st.number_input(f"{col_name} 最大值", min_value=0, max_value=5000, value=int(constraints[col_name]['max']), step=50, key=f"{col_name}_max")
+        constraints[col_name] = {'min': float(me_min), 'max': float(me_max)}
+
+    st.session_state.feed_constraints = constraints
+
+    st.info("💡 配方总量固定为 100kg，每种原料用量范围 0-80kg")
+
+    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
+    with col_btn1:
+        if st.button("🧮 计算最优配方", type="primary", **_st_btn_kwargs()):
+            with st.spinner("正在求解最优配方..."):
+                valid_ings = edited_df.dropna(subset=['原料名称', '单价(元/kg)'])
+                valid_ings = valid_ings[valid_ings['原料名称'].astype(str).str.strip() != '']
+                if len(valid_ings) == 0:
+                    st.error("❌ 请至少输入一种有效原料")
+                else:
+                    amounts, error = _solve_feed_formula(valid_ings, constraints)
+                    if amounts is not None:
+                        nutrient_values = _calculate_nutrient_values(valid_ings, amounts)
+                        constraint_checks = _check_constraints(nutrient_values, constraints)
+                        total_cost = np.sum(valid_ings['单价(元/kg)'].values * amounts)
+                        unit_price = total_cost / 100.0
+
+                        result_data = {
+                            'ingredients': valid_ings.to_dict('records'),
+                            'amounts': amounts.tolist(),
+                            'nutrient_values': nutrient_values,
+                            'constraint_checks': constraint_checks,
+                            'total_cost': total_cost,
+                            'unit_price': unit_price,
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        }
+                        st.session_state.feed_formula_result = result_data
+                        st.success("✅ 最优配方计算成功!")
+                    else:
+                        st.error(f"❌ {error}")
+                        st.info("💡 提示：请检查约束条件是否互相冲突，例如最小值大于最大值，或约束范围过窄导致无可行解")
+
+    st.markdown("---")
+
+    if st.session_state.feed_formula_result is not None:
+        result = st.session_state.feed_formula_result
+        valid_ings = pd.DataFrame(result['ingredients'])
+        amounts = np.array(result['amounts'])
+        nutrient_values = result['nutrient_values']
+        constraint_checks = result['constraint_checks']
+        total_cost = result['total_cost']
+        unit_price = result['unit_price']
+
+        st.subheader("📊 配方计算结果")
+
+        col_r1, col_r2 = st.columns([1, 1])
+
+        with col_r1:
+            pie_amounts = amounts[amounts > 0.1]
+            pie_names = valid_ings['原料名称'].values[amounts > 0.1].tolist()
+            if len(pie_amounts) > 0:
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=pie_names,
+                    values=pie_amounts,
+                    textinfo='label+percent',
+                    hovertemplate='%{label}<br>用量: %{value:.2f}kg<br>占比: %{percent}',
+                    marker=dict(colors=px.colors.qualitative.Plotly)
+                )])
+                fig_pie.update_layout(
+                    title='原料用量占比',
+                    height=400
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+        with col_r2:
+            result_rows = []
+            for i, (_, row) in enumerate(valid_ings.iterrows()):
+                amt = amounts[i]
+                if amt > 0.01:
+                    pct = amt / 100.0 * 100
+                    cost = row['单价(元/kg)'] * amt
+                    result_rows.append({
+                        '原料名称': row['原料名称'],
+                        '用量(kg)': round(amt, 2),
+                        '占比(%)': round(pct, 2),
+                        '单价(元/kg)': row['单价(元/kg)'],
+                        '分项成本(元)': round(cost, 2)
+                    })
+
+            result_df = pd.DataFrame(result_rows)
+            if not result_df.empty:
+                result_df = result_df.sort_values('用量(kg)', ascending=False)
+                total_row = pd.DataFrame([{
+                    '原料名称': '合计',
+                    '用量(kg)': round(result_df['用量(kg)'].sum(), 2),
+                    '占比(%)': round(result_df['占比(%)'].sum(), 2),
+                    '单价(元/kg)': '',
+                    '分项成本(元)': round(result_df['分项成本(元)'].sum(), 2)
+                }])
+                display_df = pd.concat([result_df, total_row], ignore_index=True)
+
+                highlight_total = pd.DataFrame('', index=display_df.index, columns=display_df.columns)
+                highlight_total.iloc[-1, :] = 'font-weight: bold; background-color: #E7E7E7'
+
+                st.dataframe(
+                    display_df.style.apply(lambda _: highlight_total, axis=None),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        st.markdown("---")
+        st.subheader("📋 营养成分验证")
+
+        check_rows = []
+        all_met = True
+        for col in NUTRIENT_COLS:
+            check = constraint_checks[col]
+            status_icon = "✅" if check['met'] else "❌"
+            deviation_text = "" if check['met'] else f" (偏差: {check['deviation']:+.4f})"
+            check_rows.append({
+                '营养成分': col,
+                '实际值': round(check['actual'], 2),
+                '约束范围': f"{check['min']} ~ {check['max']}",
+                '状态': f"{status_icon}{deviation_text}",
+                '是否满足': check['met']
+            })
+            if not check['met']:
+                all_met = False
+
+        check_df = pd.DataFrame(check_rows)
+
+        def highlight_status(s):
+            return ['background-color: #C6EFCE; color: #006100' if v else 'background-color: #FFC7CE; color: #9C0006' for v in s]
+
+        st.dataframe(
+            check_df.style.apply(highlight_status, subset=['是否满足']),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        if all_met:
+            st.success("✅ 所有营养约束均已满足!")
+        else:
+            st.warning("⚠️ 部分营养约束未满足，请检查约束条件")
+
+        st.markdown("---")
+
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        with col_m1:
+            st.metric("配方总成本", f"{total_cost:.2f} 元/100kg", delta_color="inverse")
+        with col_m2:
+            st.metric("饲料单价", f"{unit_price:.2f} 元/kg", delta_color="inverse")
+        with col_m3:
+            apply_to_batch = st.toggle(
+                "应用到批次计算",
+                value=st.session_state.global_feed_unit_price == unit_price,
+            )
+            if apply_to_batch:
+                st.session_state.global_feed_unit_price = unit_price
+                st.success("✅ 已应用到批次计算")
+            else:
+                if st.session_state.global_feed_unit_price != DEFAULT_FEED_UNIT_PRICE:
+                    st.session_state.global_feed_unit_price = DEFAULT_FEED_UNIT_PRICE
+        with col_m4:
+            st.info(f"当前批次模块单价: {st.session_state.global_feed_unit_price:.2f} 元/kg")
+
+        st.markdown("---")
+        st.subheader("📈 敏感性分析")
+
+        if len(valid_ings) > 0:
+            sen_col1, sen_col2, sen_col3 = st.columns([1, 1, 1])
+            with sen_col1:
+                sen_ingredient = st.selectbox(
+                    "选择原料",
+                    valid_ings['原料名称'].tolist(),
+                    key="sen_ingredient")
+            with sen_col2:
+                price_range_min = st.slider(
+                    "价格波动范围(%)",
+                    min_value=-50,
+                    max_value=100,
+                    value=(-30, 50),
+                    step=5,
+                    key="sen_range")
+            with sen_col3:
+                price_step = st.selectbox(
+                    "步长(%)",
+                    [5, 10, 15],
+                    index=0,
+                    key="sen_step")
+
+            if st.button("🔍 运行分析", **_st_btn_kwargs()):
+                with st.spinner("正在进行敏感性分析..."):
+                    ing_idx = valid_ings[valid_ings['原料名称'] == sen_ingredient].index[0]
+                    base_price = valid_ings.loc[ing_idx, '单价(元/kg)']
+
+                    price_changes = list(range(price_range_min[0], price_range_min[1] + 1, price_step))
+                    sen_results = []
+
+                    for change_pct in price_changes:
+                        temp_ings = valid_ings.copy()
+                        temp_ings.loc[ing_idx, '单价(元/kg)'] = base_price * (1 + change_pct / 100.0)
+                        amounts_sen, error_sen = _solve_feed_formula(temp_ings, constraints)
+                        if amounts_sen is not None:
+                            cost_sen = np.sum(temp_ings['单价(元/kg)'].values * amounts_sen)
+                            sen_results.append({
+                                'change_pct': change_pct,
+                                'price': temp_ings.loc[ing_idx, '单价(元/kg)'],
+                                'total_cost': cost_sen,
+                                'feasible': True
+                            })
+                        else:
+                            sen_results.append({
+                                'change_pct': change_pct,
+                                'price': temp_ings.loc[ing_idx, '单价(元/kg)'],
+                                'total_cost': None,
+                                'feasible': False
+                            })
+
+                    st.session_state.sensitivity_result = {
+                        'ingredient': sen_ingredient,
+                        'base_price': base_price,
+                        'results': sen_results
+                    }
+
+        if st.session_state.sensitivity_result is not None:
+            sen_result = st.session_state.sensitivity_result
+            sen_results = sen_result['results']
+            base_price = sen_result['base_price']
+
+            fig_sen = go.Figure()
+
+            feasible_x = [r['change_pct'] for r in sen_results if r['feasible']]
+            feasible_y = [r['total_cost'] for r in sen_results if r['feasible']]
+            infeasible_x = [r['change_pct'] for r in sen_results if not r['feasible']]
+            infeasible_y = [0 for _ in sen_results if not r['feasible']]
+
+            fig_sen.add_trace(go.Scatter(
+                x=feasible_x,
+                y=feasible_y,
+                mode='lines+markers',
+                name='可行解',
+                line=dict(color='#4472C4', width=2),
+                marker=dict(size=8)
+            ))
+
+            if infeasible_x:
+                fig_sen.add_trace(go.Scatter(
+                    x=infeasible_x,
+                    y=infeasible_y,
+                    mode='markers',
+                    name='无可行解',
+                    marker=dict(color='red', size=10, symbol='x')
+                ))
+
+            fig_sen.add_vline(
+                x=0,
+                line_dash="dash",
+                line_color="green",
+                annotation_text="当前价格",
+                annotation_position="top right"
+            )
+
+            fig_sen.update_layout(
+                title=f"{sen_result['ingredient']} 价格敏感性分析",
+                xaxis_title="价格变化率(%)",
+                yaxis_title="配方总成本(元/100kg)",
+                height=400,
+                hovermode='x unified'
+            )
+
+            st.plotly_chart(fig_sen, use_container_width=True)
+
+            sen_df = pd.DataFrame([{
+                '价格变化(%)': r['change_pct'],
+                '原料价格(元/kg)': round(r['price'], 2),
+                '配方成本(元/100kg)': round(r['total_cost'], 2) if r['feasible'] else '无可行解',
+                '可行性': '✅ 可行' if r['feasible'] else '❌ 不可行'
+            } for r in sen_results])
+
+            st.dataframe(sen_df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    save_col1, save_col2 = st.columns([3, 1])
+    with save_col2:
+        formula_name = st.text_input("方案名称", value=f"方案{len(st.session_state.saved_formulas) + 1}", key="save_formula_name")
+    with save_col1:
+        if st.button("💾 保存当前配方", **_st_btn_kwargs()):
+            if st.session_state.feed_formula_result is None:
+                st.warning("⚠️ 请先计算配方后再保存")
+            else:
+                saved = {
+                    'name': formula_name.strip() if formula_name.strip() else f"方案{len(st.session_state.saved_formulas) + 1}",
+                    'data': st.session_state.feed_formula_result.copy(),
+                    'saved_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                st.session_state.saved_formulas.append(saved)
+                st.success(f"✅ 配方方案「{saved['name']}」保存成功!")
+                st.rerun()
+
+    if len(st.session_state.saved_formulas) > 0:
+        st.markdown("---")
+        st.subheader("💾 已保存配方方案")
+
+        saved_names = [f"{s['name']} ({s['saved_at']})" for s in st.session_state.saved_formulas]
+        to_delete = st.multiselect("选择要删除的方案", saved_names, key="delete_formulas")
+        if st.button("🗑️ 删除选中方案", **_st_btn_kwargs()):
+            if to_delete:
+                delete_indices = [saved_names.index(n) for n in to_delete]
+                st.session_state.saved_formulas = [s for i, s in enumerate(st.session_state.saved_formulas) if i not in delete_indices]
+                st.success(f"✅ 已删除 {len(to_delete)} 个方案")
+                st.rerun()
+
+        if len(st.session_state.saved_formulas) >= 2:
+            st.markdown("---")
+            st.subheader("📊 配方方案对比")
+
+            compare_fig = go.Figure()
+
+            all_names = [s['name'] for s in st.session_state.saved_formulas]
+            all_costs = [s['data']['total_cost'] for s in st.session_state.saved_formulas]
+            max_cost_idx = all_costs.index(max(all_costs))
+
+            compare_fig.add_trace(go.Bar(
+                name='总成本(元/100kg)',
+                x=all_names,
+                y=all_costs,
+                marker_color='#ED7D31',
+                text=[f'{c:.2f}' for c in all_costs],
+                textposition='auto',
+            ))
+
+            for col in NUTRIENT_COLS:
+                nutrient_vals = []
+                for s in st.session_state.saved_formulas:
+                    nv = s['data']['nutrient_values'][col]
+                    nutrient_vals.append(nv)
+                normalize_factor = 1.0
+                if '代谢能' in col:
+                    normalize_factor = 100.0
+                compare_fig.add_trace(go.Bar(
+                        name=col,
+                        x=all_names,
+                        y=[v / normalize_factor for v in nutrient_vals],
+                        text=[f'{v:.2f}' for v in nutrient_vals],
+                        textposition='auto',
+                    ))
+
+            compare_fig.update_layout(
+                title='各方案总成本与营养成分对比',
+                xaxis_title='方案名称',
+                yaxis_title='数值',
+                barmode='group',
+                height=500,
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1
+                )
+            )
+
+            st.plotly_chart(compare_fig, use_container_width=True)
+
+            st.markdown("**原料用量对比**")
+
+            all_ingredients = set()
+            for s in st.session_state.saved_formulas:
+                for ing in s['data']['ingredients']:
+                    all_ingredients.add(ing['原料名称'])
+
+            compare_rows = []
+            for ing_name in sorted(all_ingredients):
+                row = {'原料名称': ing_name}
+                for s in st.session_state.saved_formulas:
+                    ings_df = pd.DataFrame(s['data']['ingredients'])
+                    amounts = s['data']['amounts']
+                    ing_idx = ings_df[ings_df['原料名称'] == ing_name].index
+                    if len(ing_idx) > 0:
+                        amt = amounts[ing_idx[0]]
+                        row[s['name']] = f"{amt:.2f} kg"
+                    else:
+                        row[s['name']] = "0.00 kg"
+                compare_rows.append(row)
+
+            compare_df = pd.DataFrame(compare_rows)
+
+            def highlight_max_cost(s):
+                return ['background-color: #FFC7CE; color: #9C0006' if i == max_cost_idx else '' for i in range(len(s))]
+
+            st.dataframe(
+                compare_df.style.apply(highlight_max_cost, subset=all_names),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.caption("注: 红色标注为成本最高的方案")
 
 
 def report_page(livestock_type, total_livestock):
