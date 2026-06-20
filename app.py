@@ -2237,37 +2237,43 @@ def feed_formula_page():
 
             if st.button("🔍 运行分析", **_st_btn_kwargs()):
                 with st.spinner("正在进行敏感性分析..."):
-                    ing_idx = valid_ings[valid_ings['原料名称'] == sen_ingredient].index[0]
-                    base_price = valid_ings.loc[ing_idx, '单价(元/kg)']
+                    match_mask = valid_ings['原料名称'].values == sen_ingredient
+                    match_positions = np.where(match_mask)[0]
+                    if len(match_positions) == 0:
+                        st.error("❌ 未找到所选原料")
+                    else:
+                        ing_pos = match_positions[0]
+                        base_price = valid_ings.iloc[ing_pos]['单价(元/kg)']
+                        current_constraints = st.session_state.feed_constraints
 
-                    price_changes = list(range(price_range_min[0], price_range_min[1] + 1, price_step))
-                    sen_results = []
+                        price_changes = list(range(price_range_min[0], price_range_min[1] + 1, price_step))
+                        sen_results = []
 
-                    for change_pct in price_changes:
-                        temp_ings = valid_ings.copy()
-                        temp_ings.loc[ing_idx, '单价(元/kg)'] = base_price * (1 + change_pct / 100.0)
-                        amounts_sen, error_sen = _solve_feed_formula(temp_ings, constraints)
-                        if amounts_sen is not None:
-                            cost_sen = np.sum(temp_ings['单价(元/kg)'].values * amounts_sen)
-                            sen_results.append({
-                                'change_pct': change_pct,
-                                'price': temp_ings.loc[ing_idx, '单价(元/kg)'],
-                                'total_cost': cost_sen,
-                                'feasible': True
-                            })
-                        else:
-                            sen_results.append({
-                                'change_pct': change_pct,
-                                'price': temp_ings.loc[ing_idx, '单价(元/kg)'],
-                                'total_cost': None,
-                                'feasible': False
-                            })
+                        for change_pct in price_changes:
+                            temp_ings = valid_ings.copy()
+                            temp_ings.iloc[ing_pos, temp_ings.columns.get_loc('单价(元/kg)')] = base_price * (1 + change_pct / 100.0)
+                            amounts_sen, error_sen = _solve_feed_formula(temp_ings.reset_index(drop=True), current_constraints)
+                            if amounts_sen is not None:
+                                cost_sen = np.sum(temp_ings['单价(元/kg)'].values * amounts_sen)
+                                sen_results.append({
+                                    'change_pct': change_pct,
+                                    'price': base_price * (1 + change_pct / 100.0),
+                                    'total_cost': cost_sen,
+                                    'feasible': True
+                                })
+                            else:
+                                sen_results.append({
+                                    'change_pct': change_pct,
+                                    'price': base_price * (1 + change_pct / 100.0),
+                                    'total_cost': None,
+                                    'feasible': False
+                                })
 
-                    st.session_state.sensitivity_result = {
-                        'ingredient': sen_ingredient,
-                        'base_price': base_price,
-                        'results': sen_results
-                    }
+                        st.session_state.sensitivity_result = {
+                            'ingredient': sen_ingredient,
+                            'base_price': base_price,
+                            'results': sen_results
+                        }
 
         if st.session_state.sensitivity_result is not None:
             sen_result = st.session_state.sensitivity_result
@@ -2432,11 +2438,15 @@ def feed_formula_page():
 
             compare_df = pd.DataFrame(compare_rows)
 
-            def highlight_max_cost(s):
-                return ['background-color: #FFC7CE; color: #9C0006' if i == max_cost_idx else '' for i in range(len(s))]
+            def highlight_max_cost(df):
+                result = pd.DataFrame('', index=df.index, columns=df.columns)
+                cost_col_name = all_names[max_cost_idx]
+                if cost_col_name in df.columns:
+                    result[cost_col_name] = 'background-color: #FFC7CE; color: #9C0006'
+                return result
 
             st.dataframe(
-                compare_df.style.apply(highlight_max_cost, subset=all_names),
+                compare_df.style.apply(highlight_max_cost, axis=None),
                 use_container_width=True,
                 hide_index=True
             )
